@@ -24,6 +24,7 @@ from ..core.policy_registry import POLICY_TEMPLATES, template_for
 from ..core.reporting import proof_status
 from ..core.store import Store
 from ..evidence.redaction import redact
+from ..integrations import build_registry
 from ..sandbox.manager import SandboxManager, default_demo_environment
 
 
@@ -51,6 +52,10 @@ def create_app() -> FastAPI:
     app.state.store = store
     app.state.orchestrator = orchestrator
     app.state.manager = manager
+    # Optional ecosystem adapters (SRS 20.6). Built unconditionally so the
+    # dashboard can show a disabled adapter and its setup steps; nothing here
+    # calls out until an endpoint below asks it to.
+    app.state.integrations = build_registry()
     router = APIRouter(prefix="/api")
 
     @app.exception_handler(AgentCrashError)
@@ -65,7 +70,8 @@ def create_app() -> FastAPI:
         are exactly the fields a credential could reach, so redaction belongs at
         the response boundary rather than only on the report path.
         """
-        return redact(model.model_dump(mode="json"))
+        body = model.model_dump(mode="json") if hasattr(model, "model_dump") else model
+        return redact(body)
 
     # -- health --------------------------------------------------------------
     @router.get("/health")
@@ -347,6 +353,65 @@ def create_app() -> FastAPI:
             "active_policy_versions": orchestrator.proxy.active_policy_versions,
         }
 
+    # -- optional ecosystem adapters (SRS 20.6, FR-INT-01..05) ---------------
+    #
+    # These endpoints report and exercise the optional adapters. None of them is
+    # required by the core proof loop, and each one answers honestly when its
+    # adapter is disabled or unconfigured rather than returning a fabricated
+    # result. No adapter can approve a policy or authorise a transfer.
+    @router.get("/integrations")
+    def list_integrations() -> dict[str, Any]:
+        """FR-INT-01: every adapter's state, flag and setup steps."""
+        return app.state.integrations.summary()
+
+    @router.get("/integrations/{adapter}")
+    def get_integration(adapter: str) -> dict[str, Any]:
+        integration = app.state.integrations.get(adapter)
+        if integration is None:
+            raise AgentCrashError(
+                ErrorCode.INTEGRATION_NOT_FOUND,
+                f"Unknown integration {adapter}",
+                resource_id=adapter,
+            )
+        return integration.status()
+
+    @router.post("/integrations/socket/preflight")
+    def socket_preflight(body: dict[str, Any] | None = None) -> dict[str, Any]:
+        """FR-INT-02: real dependency preflight, or an honest not-run state."""
+        body = body or {}
+        integration = app.state.integrations.get("socket")
+        purls = body.get("purls")
+        if purls is None:
+            purls = _default_preflight_purls()
+        result = integration.preflight(purls, poll=bool(body.get("poll", False)))
+        return _out(result.to_dict())
+
+    @router.post("/integrations/tigergraph/ingest/{run_id}")
+    def tigergraph_ingest(run_id: str) -> dict[str, Any]:
+        """FR-INT-03: ingest one run's recorded events; local graph unaffected."""
+        run = _require_run(store, run_id)
+        integration = app.state.integrations.get("tigergraph")
+        events = [e.model_dump(mode="json") for e in store.list_events(run.run_id)]
+        result = integration.ingest_events(events, agent_id=run.agent_id)
+        return _out(result.to_dict())
+
+    @router.get("/integrations/dodo/summary")
+    def dodo_summary() -> dict[str, Any]:
+        """FR-INT-05: read-only billing summary. Performs no charge."""
+        result = app.state.integrations.get("dodo").payment_summary()
+        return _out(result.to_dict())
+
+    @router.post("/integrations/wisprflow/parse")
+    def wisprflow_parse(body: dict[str, Any]) -> dict[str, Any]:
+        """FR-INT-04: recognise a voice command and require confirmation.
+
+        Deliberately a *parse* endpoint. It cannot execute anything, and it
+        refuses transcripts that try to approve a policy, sign a transaction or
+        move funds.
+        """
+        result = app.state.integrations.get("wisprflow").parse(body.get("transcript", ""))
+        return _out(result.to_dict())
+
     app.include_router(router)
     return app
 
@@ -401,6 +466,48 @@ def _template_dict(template) -> dict[str, Any]:
         "blocks": template.blocks,
         "legitimate_impact": template.legitimate_impact,
     }
+
+
+def _default_preflight_purls() -> list[str]:
+    """PURLs for the project's own dependency manifests (FR-INT-02).
+
+    Scanning our own manifests is the honest default: it is a real preflight
+    over packages this product actually loads, not a canned list of names. A
+    missing manifest yields no PURLs, which the adapter reports as "no packages
+    to scan" rather than as a clean result.
+    """
+    import re
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[3]
+    purls: list[str] = []
+
+    requirements = repo_root / "backend" / "requirements.txt"
+    if requirements.exists():
+        for raw in requirements.read_text().splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            match = re.match(r"^([A-Za-z0-9._-]+)\s*(?:\[[^\]]*\])?\s*([<>=!~]=?\s*[^\s,;]+)?", line)
+            if not match:
+                continue
+            name = match.group(1)
+            version = (match.group(2) or "").strip()
+            version = re.sub(r"^[<>=!~]+\s*", "", version).split(",")[0].strip()
+            purls.append(f"pkg:pypi/{name.lower()}@{version}" if version else f"pkg:pypi/{name.lower()}")
+
+    package_json = repo_root / "frontend" / "package.json"
+    if package_json.exists():
+        import json as _json
+
+        manifest = _json.loads(package_json.read_text())
+        for section in ("dependencies", "devDependencies"):
+            for name, spec in (manifest.get(section) or {}).items():
+                version = re.sub(r"^[\^~>=<\s]+", "", str(spec)).split(" ")[0].strip()
+                purls.append(
+                    f"pkg:npm/{name}@{version}" if version else f"pkg:npm/{name}"
+                )
+    return purls
 
 
 app = create_app()

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { ApiError, api } from "./api";
 import { AttackGraph } from "./components/AttackGraph";
 import { AttackTimeline } from "./components/AttackTimeline";
+import { IntegrationPanel } from "./components/IntegrationPanel";
 import { PolicyLab } from "./components/PolicyLab";
 import { ProofReport } from "./components/ProofReport";
 import { ReplayArena } from "./components/ReplayArena";
@@ -17,10 +18,12 @@ import {
 import { VERDICT_META, formatTime, shortAddress } from "./format";
 import { usePolling } from "./usePolling";
 import type {
+  AdapterResult,
   AgentConfiguration,
   AttackDefinition,
   Comparison,
   Health,
+  IntegrationSummary,
   Policy,
   PolicyTemplate,
   ReplayResult,
@@ -56,6 +59,12 @@ export function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
+  // Optional adapters (SRS 20.6). Status is read once; results are per-run.
+  const [integrations, setIntegrations] = useState<IntegrationSummary | null>(null);
+  const [integrationsError, setIntegrationsError] = useState<string | null>(null);
+  const [integrationBusy, setIntegrationBusy] = useState<string | null>(null);
+  const [integrationResult, setIntegrationResult] = useState<AdapterResult | null>(null);
+
   const loadRuns = useCallback(async () => {
     setRuns(await api.scans(50));
   }, []);
@@ -74,6 +83,12 @@ export function App() {
         setAttacks(at);
         setTemplates(t);
         setAgentId((current) => current || (a[0]?.agent_id ?? ""));
+        try {
+          setIntegrations(await api.integrations());
+        } catch (err) {
+          // An unavailable adapter list must not take down the dashboard.
+          setIntegrationsError(err instanceof Error ? err.message : String(err));
+        }
         setSelectedAttacks(at.map((x) => x.attack_id));
         await loadRuns();
       } catch (err) {
@@ -217,6 +232,34 @@ export function App() {
       setNotice("Sandbox restored to known initial state. Report history was kept.");
     });
 
+  // Optional adapters (SRS 20.6). Each action reports honestly: when an adapter
+  // is off the result says so, and the panel renders that as "not run".
+  const runIntegration = (adapter: string, arg?: string) =>
+    guard(`integration:${adapter}`, async () => {
+      setIntegrationBusy(adapter);
+      setIntegrationsError(null);
+      try {
+        let result: AdapterResult;
+        if (adapter === "socket") {
+          result = await api.socketPreflight();
+        } else if (adapter === "tigergraph") {
+          if (!activeRunId) throw new Error("Select a run before ingesting.");
+          result = await api.tigergraphIngest(activeRunId);
+        } else if (adapter === "dodo") {
+          result = await api.dodoSummary();
+        } else if (adapter === "wisprflow") {
+          // Voice is a guarded input: this recognises the command and returns it
+          // unconfirmed. It cannot approve a policy or authorise a transfer.
+          result = await api.wisprParse(arg ?? "");
+        } else {
+          throw new Error(`No runner for ${adapter}`);
+        }
+        setIntegrationResult(result);
+      } finally {
+        setIntegrationBusy(null);
+      }
+    });
+
   if (fatal) {
     return (
       <div className="mx-auto max-w-xl p-8">
@@ -344,6 +387,16 @@ export function App() {
           />
 
           <ProofReport report={report} />
+
+          <IntegrationPanel
+            summary={integrations}
+            loading={busy === "integrations"}
+            error={integrationsError}
+            onRun={runIntegration}
+            busyAdapter={integrationBusy}
+            result={integrationResult}
+            activeRunId={activeRunId}
+          />
 
           <RecentRuns
             runs={runs}

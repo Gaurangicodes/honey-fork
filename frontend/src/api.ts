@@ -1,8 +1,10 @@
 import type {
+  AdapterResult,
   AgentConfiguration,
   AttackDefinition,
   Comparison,
   Health,
+  IntegrationSummary,
   Policy,
   PolicyTemplate,
   ReplayResult,
@@ -108,4 +110,25 @@ export const api = {
   resetSandbox: () =>
     request<{ snapshot: unknown }>("/sandbox/reset", { method: "POST" }),
   sandboxState: () => request<Record<string, unknown>>("/sandbox/state"),
+
+  // -- optional ecosystem adapters (SRS 20.6) -------------------------------
+  // Each of these answers honestly when its adapter is off: the result says it
+  // did not run rather than returning an empty success. The UI must render that
+  // as "not run", never as a clean result.
+  integrations: () => request<IntegrationSummary>("/integrations"),
+  socketPreflight: (purls?: string[]) =>
+    request<AdapterResult>("/integrations/socket/preflight", {
+      method: "POST",
+      body: JSON.stringify(purls ? { purls } : {}),
+    }),
+  tigergraphIngest: (runId: string) =>
+    request<AdapterResult>(`/integrations/tigergraph/ingest/${runId}`, {
+      method: "POST",
+    }),
+  dodoSummary: () => request<AdapterResult>("/integrations/dodo/summary"),
+  wisprParse: (transcript: string) =>
+    request<AdapterResult>("/integrations/wisprflow/parse", {
+      method: "POST",
+      body: JSON.stringify({ transcript }),
+    }),
 };
