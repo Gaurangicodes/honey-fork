@@ -1,14 +1,17 @@
 """Core layer: models, store, attack library, agents, policy and wallet tool."""
 
-from .agents import SandboxAgent, agent_registry, get_agent
+from .agent_registry import AgentRegistry, agent_registry, get_agent
+from .agents import SandboxAgent
 from .attacks import SAFE_TRANSFER_LIMIT, all_attacks, get_attack
 from .errors import AgentCrashError, ReplayStateMismatch, SandboxUnavailable
 from .policy import PolicyCompiler, PolicyProxy, format_amount, normalize_address
 from .store import Store
+from .tools import ToolRegistry
 from .wallet import WalletActionResult, execute_wallet_action
 
 __all__ = [
     "AgentCrashError",
+    "AgentRegistry",
     "PolicyCompiler",
     "PolicyProxy",
     "ReplayStateMismatch",
@@ -16,6 +19,7 @@ __all__ = [
     "SandboxAgent",
     "SandboxUnavailable",
     "Store",
+    "ToolRegistry",
     "WalletActionResult",
     "agent_registry",
     "all_attacks",

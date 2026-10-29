@@ -17,6 +17,24 @@ backend/          Python API, agent runtime, sandbox and evidence store
 
 See `backend/README` in the module branch for build and run instructions.
 
+## Modules
+
+The SRS is implemented as a modular monolith. Modules land on their own
+branches and are merged to `main` as they pass their acceptance gate.
+
+| Module | Scope | Status |
+| --- | --- | --- |
+| 1 | Agent & attack management (registration, capability restriction, attack library) | done |
+| 2 | Sandbox & transaction verification (state, resets, fingerprints, verifier) | done |
+| 3 | Policy generation & enforcement (allowlist, max amount, proxy) | partial |
+| 4 | Replay, regression, scoring & reporting | partial |
+| 5 | Dashboard & scan orchestration | not started |
+| 6 | Persistence & evidence management | partial |
+
+Modules 3, 4 and 6 are implemented to the minimum needed to exercise the
+Module 1/2 proof loop end to end (attack → policy → replay → legitimate
+regression). Module 5 (the dashboard) is not started.
+
 ## Security boundary
 
 All accounts are disposable local test accounts. No production private keys,

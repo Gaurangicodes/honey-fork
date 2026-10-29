@@ -21,18 +21,20 @@ v1.0 + v1.1 addendum: an AI-agent security regression loop
 ## Layout
 
 - `backend/agentcrash/core/` — models, SQLite store, attack library, agent
-  runtime, policy proxy/compiler, wallet tool, orchestrator.
+  registry, agent runtime, tool registry, policy proxy/compiler, wallet tool,
+  orchestrator.
 - `backend/agentcrash/sandbox/` — chain adapters, sandbox manager, independent
   verifier.
 - `backend/agentcrash/api/` — FastAPI app (SRS section 7 endpoints).
-- `backend/tests/` — pytest suite.
+- `backend/tests/` — pytest suite (`test_agent_module1.py`,
+  `test_sandbox_module2.py`, `test_pipeline_e2e.py`).
 
 ## Commands
 
 ```bash
 cd backend
 pip install -r requirements.txt
-python -m pytest                                  # 40 tests
+python -m pytest                                  # 69 tests
 uvicorn agentcrash.api.app:app --port 8123        # run API
 python scripts/demo_flow.py                       # live end-to-end proof (needs API running)
 python -m pyflakes agentcrash tests scripts       # lint
@@ -55,6 +57,28 @@ not a style issue.
 5. **`TEST_ERROR` is excluded from rate denominators** and counted separately.
 6. **Secrets are redacted at the serialization boundary**
    (`evidence/redaction.py`).
+7. **An agent can only invoke a tool that is both registered and in its own
+   `tool_set`.** `ToolRegistry.invoke` and `SandboxAgent.gather_observations`
+   return a recorded `ToolCallResult(rejected=True)`; they never raise and never
+   fall through to the tool body. An unregistered-tool attempt is evidence, not
+   a security outcome.
+8. **Tool output is untrusted input.** The agent's instruction channel is the
+   attack payload *plus* the rendered tool observations, which is why AT-01/AT-02
+   can steer the agent through a mock tool. Never treat a tool response as
+   trusted.
+
+## Module 1 notes (agent & attack management)
+
+- Two configurations live in `core/agent_registry.py` and are seeded into the
+  `agent_configs` table by `api/app.py::build_state` (FR-AG-01, FR-AG-02). They
+  are identical except for `guardrail`, which is the documented differentiator.
+- `AgentRegistry.register` rejects a `tool_set` naming a tool the sandbox does
+  not expose, so a stored configuration's tool list is always true at runtime.
+- Attack `tools_used` / `tool_outputs` are how a tool-channel scenario carries
+  its injection (FR-AT-05). AT-01 drives `token.read_metadata`, AT-02 drives
+  `oracle.get_price`; AT-03/AT-04 are text-only.
+- Tool ids are constants in `core/tools.py`. Add a tool there *and* to a
+  configuration's `tool_set` before referencing it in an attack.
 
 ## Gotchas
 
