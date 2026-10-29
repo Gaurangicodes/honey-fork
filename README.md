@@ -26,7 +26,7 @@ branches and are merged to `main` as they pass their acceptance gate.
 | --- | --- | --- |
 | 1 | Agent & attack management (registration, capability restriction, attack library) | done |
 | 2 | Sandbox & transaction verification (state, resets, fingerprints, verifier) | done |
-| 3 | Policy generation & enforcement (allowlist, max amount, proxy) | partial |
+| 3 | Policy generation & enforcement (allowlist, max amount, proxy) | done |
 | 4 | Replay, regression, scoring & reporting | partial |
 | 5 | Dashboard & scan orchestration | not started |
 | 6 | Persistence & evidence management | partial |

@@ -34,7 +34,7 @@ v1.0 + v1.1 addendum: an AI-agent security regression loop
 ```bash
 cd backend
 pip install -r requirements.txt
-python -m pytest                                  # 69 tests
+python -m pytest                                  # 104 tests
 uvicorn agentcrash.api.app:app --port 8123        # run API
 python scripts/demo_flow.py                       # live end-to-end proof (needs API running)
 python -m pyflakes agentcrash tests scripts       # lint
@@ -79,6 +79,28 @@ not a style issue.
   `oracle.get_price`; AT-03/AT-04 are text-only.
 - Tool ids are constants in `core/tools.py`. Add a tool there *and* to a
   configuration's `tool_set` before referencing it in an attack.
+
+## Module 3 notes (policy generation & enforcement)
+
+- `PolicyProxy` is the enforcement boundary. It holds an applied *stack*, not a
+  single policy: an action must satisfy **every** active policy (FR-PL-03), one
+  effective policy per type. Applying an amount cap must never silently drop an
+  earlier recipient allowlist — that regression is covered by
+  `test_stack_blocks_unknown_recipient_even_when_amount_is_fine`.
+- Chain identity is checked *before* any rule, including when no policy is
+  active (SR-06). A transaction aimed at the wrong chain is never submitted.
+- `PolicyRegistry` (`core/policy_registry.py`) owns per-type version numbers and
+  append-only history. Version numbers are per type, so "allowlist v2" is
+  unambiguous alongside "amount v1".
+- `Orchestrator.apply_policy` validates parameters, then dry-runs a legitimate
+  probe against the *resulting stack* before applying. A rule that would block
+  the known legitimate transfer is refused (FR-PL-05, Guardrail B).
+- Only `template_for()`-backed types can be applied. An attack with no supported
+  template returns `None` from the compiler and the API reports "no automatic
+  fix" (FR-PL-06) rather than inventing a generic rule.
+- Replay deliberately runs under the *currently applied* stack. A cap alone does
+  not block AT-01, and the verifier correctly reports `EXPLOIT_SUCCEEDED` /
+  `FAILED` in that case — do not "fix" this into a block.
 
 ## Gotchas
 

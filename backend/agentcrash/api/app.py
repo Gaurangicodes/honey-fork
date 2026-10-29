@@ -18,6 +18,7 @@ from ..core.attacks import all_attacks, get_attack
 from ..core.errors import AgentCrashError
 from ..core.models import AgentConfiguration, ErrorCode, ScanRequest
 from ..core.orchestrator import Orchestrator
+from ..core.policy_registry import POLICY_TEMPLATES, template_for
 from ..core.store import Store
 from ..evidence.redaction import redact
 from ..sandbox.manager import SandboxManager, default_demo_environment
@@ -62,6 +63,8 @@ def create_app() -> FastAPI:
                 "token_contract": env.token_contract,
             },
             "active_policy_version": orchestrator.proxy.active_policy_version,
+            "active_policy_versions": orchestrator.proxy.active_policy_versions,
+            "active_policy_count": len(orchestrator.proxy.active_policies),
         }
 
     # -- agents & attacks ----------------------------------------------------
@@ -159,16 +162,56 @@ def create_app() -> FastAPI:
         return {
             "policy": policies[0].model_dump(mode="json"),
             "policies": [p.model_dump(mode="json") for p in policies],
+            "templates": [
+                _template_dict(template_for(p.type))
+                for p in policies
+                if template_for(p.type) is not None
+            ],
         }
 
     @router.post("/policies/{policy_id}/apply")
     def apply_policy(policy_id: str) -> dict[str, Any]:
         policy = orchestrator.apply_policy(policy_id)
-        return {"policy": policy.model_dump(mode="json")}
+        template = template_for(policy.type)
+        return {
+            "policy": policy.model_dump(mode="json"),
+            "template": _template_dict(template) if template else None,
+            "active_stack": [
+                p.model_dump(mode="json") for p in orchestrator.proxy.active_policies
+            ],
+        }
 
     @router.get("/policies")
     def list_policies() -> list[dict[str, Any]]:
         return [p.model_dump(mode="json") for p in store.list_policies()]
+
+    @router.get("/policies/active")
+    def active_policies() -> dict[str, Any]:
+        """FR-PL-03: the applied stack currently enforced on every transaction."""
+        stack = orchestrator.proxy.active_policies
+        return {
+            "active_policies": [p.model_dump(mode="json") for p in stack],
+            "versions": [p.version for p in stack],
+            "count": len(stack),
+        }
+
+    @router.get("/policies/templates")
+    def policy_templates() -> list[dict[str, Any]]:
+        """FR-PL-06/FR-PL-07: the supported rule types and what each one blocks."""
+        return [_template_dict(t) for t in POLICY_TEMPLATES.values()]
+
+    @router.get("/policies/{policy_id}")
+    def get_policy(policy_id: str) -> dict[str, Any]:
+        policy = store.get_policy(policy_id)
+        if policy is None:
+            raise AgentCrashError(
+                ErrorCode.POLICY_NOT_FOUND, f"No policy {policy_id}", resource_id=policy_id
+            )
+        template = template_for(policy.type)
+        return {
+            "policy": policy.model_dump(mode="json"),
+            "template": _template_dict(template) if template else None,
+        }
 
     # -- replay --------------------------------------------------------------
     @router.post("/scans/{run_id}/replay")
@@ -184,6 +227,9 @@ def create_app() -> FastAPI:
             "replay_run": replay_run.model_dump(mode="json"),
             "regression": regression.model_dump(mode="json"),
             "proof_status": _proof_status(replay_run, regression),
+            "active_stack": [
+                p.model_dump(mode="json") for p in orchestrator.proxy.active_policies
+            ],
         }
 
     # -- reports -------------------------------------------------------------
@@ -232,7 +278,10 @@ def create_app() -> FastAPI:
             policy_version=orchestrator.proxy.active_policy_version,
             attack_id=None,
         )
-        return {"snapshot": snapshot.model_dump(mode="json")}
+        return {
+            "snapshot": snapshot.model_dump(mode="json"),
+            "active_policy_versions": orchestrator.proxy.active_policy_versions,
+        }
 
     app.include_router(router)
     return app
@@ -243,6 +292,18 @@ def _require_run(store: Store, run_id: str):
     if run is None:
         raise AgentCrashError(ErrorCode.RUN_NOT_FOUND, f"No run {run_id}", resource_id=run_id)
     return run
+
+
+def _template_dict(template) -> dict[str, Any]:
+    """FR-PL-07: the plain-language contract of a policy type."""
+    return {
+        "type": template.policy_type.value,
+        "label": template.label,
+        "summary": template.summary,
+        "parameters": list(template.parameters),
+        "blocks": template.blocks,
+        "legitimate_impact": template.legitimate_impact,
+    }
 
 
 def _proof_status(replay_run, regression) -> dict[str, Any]:
