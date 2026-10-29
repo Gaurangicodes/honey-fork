@@ -48,27 +48,93 @@ def format_amount(amount: int, decimals: int) -> str:
     return f"{whole}.{fraction:0{decimals}d}".rstrip("0").rstrip(".")
 
 
+def _diff_line(name: str, before: Any, after: Any, note: str = "") -> dict[str, Any]:
+    """FR-PL-07: one structured before/after entry for the policy diff."""
+    return {"parameter": name, "before": before, "after": after, "note": note}
+
+
 class PolicyProxy:
     """Enforces the currently active policy version on structured actions."""
 
-    def __init__(self, active_policy: Policy | None = None) -> None:
-        self.active_policy = active_policy
+    def __init__(
+        self,
+        active_policy: Policy | None = None,
+        expected_chain_id: int | None = None,
+        active_policies: list[Policy] | None = None,
+    ) -> None:
+        # `active_policies` is the applied stack (FR-PL-03). `active_policy` is
+        # kept as the single-policy convenience for callers that only ever apply
+        # one rule; when both are given the stack wins.
+        self.active_policies: list[Policy] = list(active_policies or [])
+        if active_policy is not None and not self.active_policies:
+            self.active_policies = [active_policy]
+        # FR-SB-01/FR-PL-03: the chain identity the proxy is allowed to submit to.
+        # Defaults to the Anvil/local demo chain id.
+        self.expected_chain_id = 31337 if expected_chain_id is None else expected_chain_id
+
+    def set_stack(self, policies: list[Policy]) -> None:
+        self.active_policies = list(policies)
+
+    def add_to_stack(self, policy: Policy) -> None:
+        """Replace any active policy of the same type, then add this one.
+
+        One effective policy per type keeps the stack predictable: applying a
+        second allowlist supersedes the first rather than creating an
+        unsatisfiable pair.
+        """
+        self.active_policies = [p for p in self.active_policies if p.type is not policy.type]
+        self.active_policies.append(policy)
 
     def set_active_policy(self, policy: Policy | None) -> None:
-        self.active_policy = policy
+        self.active_policies = [policy] if policy is not None else []
+
+    @property
+    def active_policy(self) -> Policy | None:
+        return self.active_policies[-1] if self.active_policies else None
 
     @property
     def active_policy_version(self) -> str | None:
         return self.active_policy.version if self.active_policy else None
 
+    @property
+    def active_policy_versions(self) -> list[str]:
+        return [p.version for p in self.active_policies]
+
     def evaluate(self, action: WalletAction) -> PolicyDecision:
-        return self.evaluate_with(self.active_policy, action)
+        """FR-PL-03: the action must satisfy every active policy."""
+        if not self.active_policies:
+            return self.evaluate_with(None, action)
+        for policy in self.active_policies:
+            decision = self.evaluate_with(policy, action)
+            if not decision.allowed:
+                return decision
+        versions = ", ".join(f"v{p.version} ({p.type.value})" for p in self.active_policies)
+        return PolicyDecision(
+            allowed=True,
+            reason_code="ALL_POLICIES_ALLOWED",
+            reason=f"Action satisfies all active policies: {versions}",
+            policy_version=",".join(self.active_policy_versions),
+            checked_action=action,
+        )
 
     def evaluate_with(
         self, policy: Policy | None, action: WalletAction
     ) -> PolicyDecision:
         """Evaluate an action against an explicit policy, without changing which
         policy is active. Used for pre-application dry runs."""
+        # Chain identity is checked before any rule: a correctly-formed transfer
+        # aimed at the wrong chain must never be submitted (FR-SB-01, SR-06).
+        if action.chain_id != self.expected_chain_id:
+            return PolicyDecision(
+                allowed=False,
+                reason_code="CHAIN_MISMATCH",
+                reason=(
+                    f"Action targets chain {action.chain_id} but the sandbox chain is "
+                    f"{self.expected_chain_id}"
+                ),
+                policy_version=policy.version if policy else None,
+                checked_action=action,
+            )
         if policy is None:
             return PolicyDecision(
                 allowed=True,
@@ -186,10 +252,11 @@ class PolicyCompiler:
             approved = observed.get("approved_recipient")
             if not approved:
                 return None
+            normalized = normalize_address(approved)
             policy = Policy(
                 version=version,
                 type=PolicyType.RECIPIENT_ALLOWLIST,
-                parameters={"allowed_recipients": [normalize_address(approved)]},
+                parameters={"allowed_recipients": [normalized]},
                 source_run_id=run_id,
                 source_attack_id=attack.attack_id,
                 rationale=(
@@ -204,6 +271,14 @@ class PolicyCompiler:
                 ),
                 status=PolicyStatus.PROPOSED,
             )
+            policy.diff = [
+                _diff_line(
+                    "allowed_recipients",
+                    before=[],
+                    after=[normalized],
+                    note="recipients permitted to receive transfers",
+                )
+            ]
             return policy
         if attack.supported_policy_type is PolicyType.MAX_AMOUNT:
             limit = observed.get("suggested_limit")
@@ -227,5 +302,13 @@ class PolicyCompiler:
                 ),
                 status=PolicyStatus.PROPOSED,
             )
+            policy.diff = [
+                _diff_line(
+                    "max_amount",
+                    before="unlimited",
+                    after=f"{format_amount(int(limit), int(decimals))} TST",
+                    note="largest single transfer permitted",
+                )
+            ]
             return policy
         return None

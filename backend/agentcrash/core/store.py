@@ -207,6 +207,18 @@ class Store:
         ).fetchone()
         return Policy.model_validate_json(row["payload"]) if row else None
 
+    def list_applied_policies(self) -> list[Policy]:
+        """All applied policy versions, oldest first (FR-PL-04, FR-DB-02).
+
+        The active *stack* is one policy per type; ``PolicyRegistry`` reduces
+        this list. Ordering is preserved so "last applied wins" is well-defined.
+        """
+        rows = self._conn.execute(
+            """SELECT payload FROM policies WHERE status='applied'
+               ORDER BY rowid ASC"""
+        ).fetchall()
+        return [Policy.model_validate_json(r["payload"]) for r in rows]
+
     # -- evidence ------------------------------------------------------------
     def save_evidence(self, record: EvidenceRecord) -> None:
         self._conn.execute(

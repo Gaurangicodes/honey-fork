@@ -22,6 +22,7 @@ from .models import (
     FixStatus,
     Policy,
     PolicyStatus,
+    PolicyType,
     RegressionResult,
     Report,
     RunEvent,
@@ -32,7 +33,8 @@ from .models import (
     VerificationStatus,
     WalletAction,
 )
-from .policy import PolicyCompiler, PolicyProxy
+from .policy import PolicyCompiler, PolicyProxy, normalize_address
+from .policy_registry import PolicyRegistry, template_for
 from .store import Store
 from .tools import ToolRegistry
 from .wallet import execute_wallet_action
@@ -60,7 +62,15 @@ class Orchestrator:
             unauthorized_recipient=environment.unauthorized_recipient,
             token_contract=environment.token_contract,
         )
-        self.proxy = PolicyProxy(active_policy=store.latest_applied_policy())
+        self.proxy = PolicyProxy(
+            active_policy=store.latest_applied_policy(),
+            expected_chain_id=environment.chain.chain_id,
+        )
+        self.policies = PolicyRegistry(store)
+        # FR-PL-03: the proxy enforces the whole applied stack, not just the most
+        # recently applied policy, so an earlier allowlist is not silently
+        # dropped when an amount cap is applied afterwards.
+        self.proxy.set_stack(self.policies.active_policies())
 
     # -- helpers -------------------------------------------------------------
     def _emit(self, run: ScanRun, event_type: str, message: str, **data: Any) -> RunEvent:
@@ -355,7 +365,9 @@ class Orchestrator:
             "suggested_limit": SAFE_TRANSFER_LIMIT,
             "decimals": self.environment.decimals,
         }
-        existing = [p for p in self.store.list_policies() if p.source_attack_id == attack.attack_id]
+        # Version numbers are per policy type (FR-DB-02), so "allowlist v2" stays
+        # unambiguous even when amount-cap versions exist alongside it.
+        existing = self.policies.history(attack.supported_policy_type)
         policy = self.compiler.compile(
             attack=attack, run_id=run.run_id, observed=observed, existing_versions=len(existing)
         )
@@ -397,25 +409,117 @@ class Orchestrator:
         return run
 
     def apply_policy(self, policy_id: str) -> Policy:
-        """FR-PL-04: explicit approval creates a new applied policy version."""
+        """FR-PL-04: explicit approval creates a new applied policy version.
+
+        Applying never rewrites history. The approved policy is added to the
+        active stack (replacing any earlier policy of the same type), so a
+        second rule type composes with the first instead of replacing it
+        (FR-PL-03).
+        """
         policy = self.store.get_policy(policy_id)
         if policy is None:
             raise AgentCrashError(
                 ErrorCode.POLICY_NOT_FOUND, f"No policy {policy_id}", resource_id=policy_id
             )
+        if policy.status is PolicyStatus.APPLIED:
+            return policy  # idempotent: applying an applied policy is a no-op
+        self._validate_policy(policy)
+        # FR-PL-05 / Guardrail B: refuse a rule that would break the known
+        # legitimate transaction.
         self._assert_no_p0_regression(policy)
+
         policy.status = PolicyStatus.APPLIED
         self.store.save_policy(policy)
-        self.proxy.set_active_policy(policy)
+        self.proxy.add_to_stack(policy)
+        self._emit_policy_applied(policy)
         return policy
+
+    def _validate_policy(self, policy: Policy) -> None:
+        """FR-PL-02/FR-PL-07: validate parameters before the policy is applied.
+
+        Addresses are normalized and amounts are checked for correct units and
+        token decimals, so a malformed rule is rejected with a readable reason
+        rather than failing open at transaction time.
+        """
+        template = template_for(policy.type)
+        if template is None:
+            raise AgentCrashError(
+                ErrorCode.POLICY_VALIDATION_FAILED,
+                f"Policy type {policy.type} has no supported template",
+                resource_id=policy.policy_id,
+            )
+        if policy.type is PolicyType.RECIPIENT_ALLOWLIST:
+            allowed = policy.parameters.get("allowed_recipients")
+            if not isinstance(allowed, list) or not allowed:
+                raise AgentCrashError(
+                    ErrorCode.POLICY_VALIDATION_FAILED,
+                    "recipient_allowlist requires a non-empty allowed_recipients list",
+                    resource_id=policy.policy_id,
+                )
+            for address in allowed:
+                try:
+                    normalize_address(address)
+                except ValueError as exc:
+                    raise AgentCrashError(
+                        ErrorCode.POLICY_VALIDATION_FAILED,
+                        f"Invalid recipient address in policy: {exc}",
+                        resource_id=policy.policy_id,
+                    ) from exc
+        elif policy.type is PolicyType.MAX_AMOUNT:
+            raw_limit = policy.parameters.get("max_amount")
+            try:
+                limit = int(raw_limit)
+            except (TypeError, ValueError) as exc:
+                raise AgentCrashError(
+                    ErrorCode.POLICY_VALIDATION_FAILED,
+                    f"max_transaction_amount requires an integer max_amount: {exc}",
+                    resource_id=policy.policy_id,
+                ) from exc
+            if limit <= 0:
+                raise AgentCrashError(
+                    ErrorCode.POLICY_VALIDATION_FAILED,
+                    "max_amount must be positive",
+                    resource_id=policy.policy_id,
+                )
+            decimals = policy.parameters.get("decimals", self.environment.decimals)
+            if int(decimals) != self.environment.decimals:
+                raise AgentCrashError(
+                    ErrorCode.POLICY_VALIDATION_FAILED,
+                    (
+                        f"Policy uses {decimals} decimals but the environment token uses "
+                        f"{self.environment.decimals}; amounts would be misread"
+                    ),
+                    resource_id=policy.policy_id,
+                )
+
+    def _emit_policy_applied(self, policy: Policy) -> None:
+        """Record the application on the run that produced the policy (FR-DB-02)."""
+        if not policy.source_run_id:
+            return
+        run = self.store.get_run(policy.source_run_id)
+        if run is None:
+            return
+        template = template_for(policy.type)
+        self._emit(
+            run,
+            "policy_applied",
+            f"Applied {policy.type.value} v{policy.version}",
+            policy_id=policy.policy_id,
+            policy_type=policy.type.value,
+            version=policy.version,
+            parameters=policy.parameters,
+            blocks=template.blocks if template else "",
+            active_stack=self.proxy.active_policy_versions,
+        )
 
     def _assert_no_p0_regression(self, policy: Policy) -> None:
         """Guardrail B: never mark a fix verified when a legitimate transaction
         fails, the replay state differs, or evidence is insufficient.
 
         Before a policy is applied we dry-run a known legitimate transaction
-        against it. If that transaction would be rejected, the policy is not
-        enforceable without breaking legitimate behavior, so it is not applied.
+        against the *resulting stack* (the existing policies plus this one). If
+        that transaction would be rejected, the policy is not enforceable
+        without breaking legitimate behavior, so it is not applied.
         """
         probe = WalletAction(
             action_type="transfer",
@@ -427,16 +531,18 @@ class Orchestrator:
             decimals=self.environment.decimals,
             source="regression",
         )
-        decision = self.proxy.evaluate_with(policy, probe)
-        if not decision.allowed:
-            raise AgentCrashError(
-                ErrorCode.POLICY_VALIDATION_FAILED,
-                (
-                    f"Policy {policy.policy_id} would block a legitimate transfer "
-                    f"({decision.reason_code}). It was not applied."
-                ),
-                resource_id=policy.policy_id,
-            )
+        stack = [p for p in self.proxy.active_policies if p.type is not policy.type] + [policy]
+        for active in stack:
+            decision = self.proxy.evaluate_with(active, probe)
+            if not decision.allowed:
+                raise AgentCrashError(
+                    ErrorCode.POLICY_VALIDATION_FAILED,
+                    (
+                        f"Policy {policy.policy_id} would block a legitimate transfer "
+                        f"({decision.reason_code}). It was not applied."
+                    ),
+                    resource_id=policy.policy_id,
+                )
 
     # -- replay --------------------------------------------------------------
     def replay(
@@ -451,6 +557,10 @@ class Orchestrator:
 
         `run_id` may be a scan or a trial; the original trial that produced the
         verified exploit is selected automatically.
+
+        `policy_id` selects the policy to test. When omitted, the currently
+        applied policy stack is used, which is the normal flow: apply a fix,
+        then replay the attack under it.
         """
         original = self._resolve_original_run(run_id)
         if original.environment_snapshot_id is None:
@@ -462,8 +572,8 @@ class Orchestrator:
 
         if policy_id is not None:
             self.apply_policy(policy_id)
-        active = self.proxy.active_policy
-        if active is None:
+
+        if not self.proxy.active_policies:
             raise AgentCrashError(
                 ErrorCode.POLICY_VALIDATION_FAILED,
                 "Replay requires an applied policy",
@@ -500,7 +610,7 @@ class Orchestrator:
             parent_run_id=original.run_id,
             run_type=RunType.REPLAY,
             status=RunStatus.RUNNING,
-            policy_version=active.version,
+            policy_version=self.proxy.active_policy_version,
             attack_version=attack.version,
             agent_config_version=agent_config.configuration_version,
             environment_id=self.environment.environment_id,
@@ -511,7 +621,7 @@ class Orchestrator:
         self._emit(
             replay_run,
             "replay_started",
-            f"Replaying {attack.attack_id} under policy v{active.version}",
+            f"Replaying {attack.attack_id} under policy stack {self.proxy.active_policy_versions}",
             fingerprint=restored.fingerprint(),
         )
 
@@ -583,7 +693,7 @@ class Orchestrator:
         regression = self._run_legitimate_regression(
             original_run=original,
             replay_run=replay_run,
-            policy_version=active.version,
+            policy_version=self.proxy.active_policy_version,
             recipient=legitimate_recipient or self.environment.approved_recipient,
             amount=legitimate_amount
             if legitimate_amount is not None

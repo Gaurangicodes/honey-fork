@@ -281,6 +281,8 @@ class Policy(BaseModel):
     rationale: str = ""
     expected_effect: str = ""
     legitimate_task_impact: str = ""
+    # FR-PL-07: structured before/after parameter changes shown in Policy Lab.
+    diff: list[dict[str, Any]] = Field(default_factory=list)
     status: PolicyStatus = PolicyStatus.PROPOSED
     created_at: datetime = Field(default_factory=utcnow)
 
