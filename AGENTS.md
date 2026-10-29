@@ -34,7 +34,7 @@ v1.0 + v1.1 addendum: an AI-agent security regression loop
 ```bash
 cd backend
 pip install -r requirements.txt
-python -m pytest                                  # 104 tests
+python -m pytest                                  # 132 tests
 uvicorn agentcrash.api.app:app --port 8123        # run API
 python scripts/demo_flow.py                       # live end-to-end proof (needs API running)
 python -m pyflakes agentcrash tests scripts       # lint
@@ -101,6 +101,33 @@ not a style issue.
 - Replay deliberately runs under the *currently applied* stack. A cap alone does
   not block AT-01, and the verifier correctly reports `EXPLOIT_SUCCEEDED` /
   `FAILED` in that case — do not "fix" this into a block.
+
+## Module 4 notes (replay, scoring & reporting)
+
+- The arithmetic lives in `core/reporting.py` as pure functions over run
+  records. `build_report` and the tests both call them, so the numbers in a
+  report cannot drift from the numbers under test (NFR-08).
+- **ASR and DBR are different populations, deliberately.** ASR is measured over
+  unprotected baseline trials ("can this agent be exploited"); DBR over trials
+  with a policy in force ("does the fix work"). Pooling them would let a
+  successful fix hide a still-exploitable agent. `is_protected()` keys off the
+  run's `policy_version`, so a guarded agent with no applied policy is *not*
+  protected.
+- `build_report` pulls in replay runs (children of the attack trials). Without
+  them there are no protected trials, so DBR is `0/0` and the score is
+  unavailable even after a verified fix.
+- `RegressionResult.aggregate` marks the summary written by a repeated replay.
+  It is excluded from the legitimate-task denominator, otherwise a 3x replay
+  reports 4/4. `comparison()` prefers the aggregate since only it carries the
+  before/after rates.
+- Replay receipts (`core/receipts.py`) are persisted as `replay_receipt`
+  evidence on the replay run. `_receipts_for` follows child runs to find them.
+- `replay(repeat_count=N)` re-runs the attack N times and only reports
+  `VERIFIED` when *every* trial blocked the attack and *every* legitimate
+  regression passed (FR-RP-05). One lucky block is not a fix.
+- Exposure is a scenario, not a prediction: it is the largest amount actually
+  observed in the suite, alongside the agent's whole test balance as a worst
+  case. Both are labelled with their assumptions.
 
 ## Gotchas
 

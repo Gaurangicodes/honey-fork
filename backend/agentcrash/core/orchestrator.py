@@ -35,6 +35,8 @@ from .models import (
 )
 from .policy import PolicyCompiler, PolicyProxy, normalize_address
 from .policy_registry import PolicyRegistry, template_for
+from .receipts import build_receipt, build_report_payload
+from .reporting import compute_metrics, proof_status
 from .store import Store
 from .tools import ToolRegistry
 from .wallet import execute_wallet_action
@@ -552,6 +554,109 @@ class Orchestrator:
         policy_id: str | None = None,
         legitimate_recipient: str | None = None,
         legitimate_amount: int | None = None,
+        repeat_count: int = 1,
+    ) -> tuple[ScanRun, RegressionResult]:
+        """FR-RP-01/05: replay the attack `repeat_count` times and aggregate.
+
+        Model output may be nondeterministic, so a single replay is a repeated
+        experiment rather than a deterministic proof. Repeating it and reporting
+        before/after rates is what keeps a lucky block from being presented as a
+        verified fix. A fix is VERIFIED only when *every* replay blocked the
+        attack and *every* legitimate regression passed.
+        """
+        if repeat_count < 1:
+            raise AgentCrashError(
+                ErrorCode.POLICY_VALIDATION_FAILED,
+                "repeat_count must be at least 1",
+                status_code=400,
+            )
+        results: list[tuple[ScanRun, RegressionResult]] = []
+        for _ in range(repeat_count):
+            results.append(
+                self._replay_once(
+                    run_id,
+                    policy_id=policy_id,
+                    legitimate_recipient=legitimate_recipient,
+                    legitimate_amount=legitimate_amount,
+                )
+            )
+        first_run, first_regression = results[0]
+        if len(results) == 1:
+            return first_run, first_regression
+        return first_run, self._aggregate_replays(results, run_id)
+
+    def _aggregate_replays(
+        self,
+        results: list[tuple[ScanRun, RegressionResult]],
+        original_run_id: str,
+    ) -> RegressionResult:
+        """FR-RP-05: before/after rates over repeated replay trials."""
+        replay_runs = [run for run, _ in results]
+        regressions = [reg for _, reg in results]
+        total = len(regressions)
+        blocked = sum(1 for r in regressions if r.attack_blocked)
+        passed = sum(1 for r in regressions if r.legitimate_task_passed)
+
+        original = self._resolve_original_run(original_run_id)
+        baseline = self.store.get_snapshot(original.environment_snapshot_id) if original.environment_snapshot_id else None
+        baseline_trials = self._trials_for(original.parent_run_id or original.run_id)
+        baseline_valid = [t for t in baseline_trials if t.verdict is not None and t.verdict is not Verdict.TEST_ERROR]
+        baseline_exploits = sum(1 for t in baseline_valid if t.verdict is Verdict.EXPLOIT_SUCCEEDED)
+        baseline_rate = round(baseline_exploits / len(baseline_valid) * 100, 2) if baseline_valid else 0.0
+
+        every_blocked = blocked == total
+        every_passed = passed == total
+        if every_blocked and every_passed:
+            fix_status = FixStatus.VERIFIED
+        elif every_blocked:
+            fix_status = FixStatus.BLOCKED_BUT_REGRESSION
+        elif any(r.fix_status is FixStatus.NOT_REPRODUCED for r in regressions):
+            fix_status = FixStatus.NOT_REPRODUCED
+        else:
+            fix_status = FixStatus.INCOMPLETE
+
+        aggregate = RegressionResult(
+            original_run_id=original.run_id,
+            replay_run_id=replay_runs[0].run_id,
+            policy_version=self.proxy.active_policy_version,
+            aggregate=True,
+            attack_blocked=every_blocked,
+            legitimate_task_passed=every_passed,
+            verification_status=(
+                VerificationStatus.VERIFIED
+                if fix_status is FixStatus.VERIFIED
+                else VerificationStatus.FAILED
+                if fix_status in (FixStatus.BLOCKED_BUT_REGRESSION, FixStatus.NOT_REPRODUCED)
+                else VerificationStatus.INCONCLUSIVE
+            ),
+            fix_status=fix_status,
+            details={
+                "repeat_count": total,
+                "replay_run_ids": [r.run_id for r in replay_runs],
+                "verdicts": [r.verdict.value if r.verdict else None for r in replay_runs],
+                "before_rate": baseline_rate,
+                "after_rate": round(blocked / total * 100, 2),
+                "before_exploits": baseline_exploits,
+                "before_valid_trials": len(baseline_valid),
+                "blocked_trials": blocked,
+                "legitimate_passed_trials": passed,
+                "baseline_fingerprint": baseline.fingerprint() if baseline else None,
+                "note": (
+                    "A rate over repeated trials is stronger evidence than one run, "
+                    "but still not a general security guarantee."
+                ),
+            },
+        )
+        self.store.save_regression(aggregate)
+        return aggregate
+
+    def _replay_once(
+        self,
+        run_id: str,
+        *,
+        policy_id: str | None = None,
+        legitimate_recipient: str | None = None,
+        legitimate_amount: int | None = None,
     ) -> tuple[ScanRun, RegressionResult]:
         """FR-RP-01..06: equivalent-state replay plus legitimate regression.
 
@@ -699,6 +804,33 @@ class Orchestrator:
             if legitimate_amount is not None
             else 100 * 10**self.environment.decimals,
         )
+
+        # FR-RP-03: persist the replay receipt as evidence so it can be exported
+        # later without re-deriving anything from the runs.
+        receipt = build_receipt(
+            original=original,
+            replay=replay_run,
+            regression=regression,
+            baseline=baseline,
+            restored=restored,
+            attack=attack,
+            agent_config=agent_config,
+            active_policies=self.proxy.active_policies,
+        )
+        self.store.save_evidence(
+            EvidenceRecord(
+                run_id=replay_run.run_id,
+                event_type="replay_receipt",
+                status=regression.fix_status.value,
+                details=receipt,
+            )
+        )
+        self._emit(
+            replay_run,
+            "replay_receipt",
+            f"Replay receipt {receipt['schema_version']} recorded",
+            fix_status=regression.fix_status.value,
+        )
         return replay_run, regression
 
     def _run_legitimate_regression(
@@ -779,6 +911,71 @@ class Orchestrator:
         )
         return regression
 
+    def comparison(self, original_run_id: str, replay_run_id: str) -> dict[str, Any]:
+        """FR-RP-02 / FR-RE-07: before/after view tied to verified records.
+
+        Every value comes from persisted runs, snapshots and regressions. The
+        UI must not compute its own green/red states from anything else.
+        """
+        original = self.store.get_run(original_run_id)
+        replay = self.store.get_run(replay_run_id)
+        if original is None or replay is None:
+            raise AgentCrashError(
+                ErrorCode.RUN_NOT_FOUND,
+                "Both the original and replay runs must exist to compare them",
+                resource_id=original_run_id,
+            )
+        baseline = (
+            self.store.get_snapshot(original.environment_snapshot_id)
+            if original.environment_snapshot_id
+            else None
+        )
+        restored = (
+            self.store.get_snapshot(replay.environment_snapshot_id)
+            if replay.environment_snapshot_id
+            else None
+        )
+        regressions = self.store.list_regressions(original.run_id)
+        # Prefer a repeated-replay summary when one exists: it carries the
+        # before/after rates, which a single trial cannot.
+        regression = next((r for r in regressions if r.aggregate), None) or next(
+            (r for r in regressions if r.replay_run_id == replay_run_id),
+            regressions[-1] if regressions else None,
+        )
+        fingerprints_match = (
+            baseline is not None
+            and restored is not None
+            and baseline.fingerprint() == restored.fingerprint()
+        )
+        return {
+            "original": {
+                "run_id": original.run_id,
+                "verdict": original.verdict.value if original.verdict else None,
+                "verdict_reason": original.verdict_reason,
+                "policy_version": original.policy_version,
+                "transaction_hashes": original.transaction_hashes,
+                "balance_deltas": [d.model_dump(mode="json") for d in original.balance_deltas],
+                "fingerprint": baseline.fingerprint() if baseline else None,
+            },
+            "replay": {
+                "run_id": replay.run_id,
+                "verdict": replay.verdict.value if replay.verdict else None,
+                "verdict_reason": replay.verdict_reason,
+                "policy_version": replay.policy_version,
+                "transaction_hashes": replay.transaction_hashes,
+                "balance_deltas": [d.model_dump(mode="json") for d in replay.balance_deltas],
+                "fingerprint": restored.fingerprint() if restored else None,
+            },
+            # FR-RP-06: without this, the before/after numbers are not comparable.
+            "state_equivalence": {
+                "equivalent": fingerprints_match,
+                "baseline_fingerprint": baseline.fingerprint() if baseline else None,
+                "replay_fingerprint": restored.fingerprint() if restored else None,
+            },
+            "regression": regression.model_dump(mode="json") if regression else None,
+            "proof_status": proof_status(replay, regression) if regression else None,
+        }
+
     # -- reporting -----------------------------------------------------------
     def build_report(self, run_ids: list[str]) -> Report:
         """FR-RE-01..06: aggregate metrics and produce an exportable report.
@@ -787,58 +984,56 @@ class Orchestrator:
         verdicts and evidence live on the trials. Passed trial IDs are used
         as-is. Infrastructure failures are counted separately and excluded from
         the rate denominators (FR-RE-01).
+
+        The arithmetic lives in `core/reporting.py` so the same functions the
+        tests exercise are the ones that fill the report (NFR-08).
+
+        Replay runs are included because they are what makes a defense blocking
+        rate and an indicative score computable at all: without them there are
+        no protected trials to measure (FR-RE-02/04).
         """
         trials: list[ScanRun] = []
+        seen: set[str] = set()
         for run_id in run_ids:
-            trials.extend(self._trials_for(run_id))
-        valid = [r for r in trials if r.verdict is not None and r.verdict is not Verdict.TEST_ERROR]
-        exploits = [r for r in valid if r.verdict is Verdict.EXPLOIT_SUCCEEDED]
-        blocked = [r for r in valid if r.verdict is Verdict.ATTEMPT_BLOCKED]
-        errors = [r for r in trials if r.verdict is Verdict.TEST_ERROR]
-
-        asr = (len(exploits) / len(valid) * 100) if valid else 0.0
-        dbr = (len(blocked) / len(valid) * 100) if valid else 0.0
+            for run in self._trials_for(run_id):
+                if run.run_id in seen:
+                    continue
+                seen.add(run.run_id)
+                trials.append(run)
+                for child in self.store.list_child_runs(run.run_id):
+                    if child.run_id not in seen:
+                        seen.add(child.run_id)
+                        trials.append(child)
 
         regressions: list[RegressionResult] = []
         for run in trials:
             regressions.extend(self.store.list_regressions(run.run_id))
-        legitimate_total = len(regressions)
-        legitimate_passed = sum(1 for r in regressions if r.legitimate_task_passed)
-        legitimate_rate = (
-            legitimate_passed / legitimate_total * 100 if legitimate_total else 0.0
+
+        policies = self.policies.history()
+        payload = build_report_payload(
+            trials=trials,
+            regressions=regressions,
+            environment=self.environment,
+            policies=policies,
+            suites=self._suite_descriptors(trials),
         )
+        metrics = compute_metrics(trials, regressions, environment=self.environment)
 
         report = Report(
             run_ids=[r.run_id for r in trials],
-            metrics={
-                "attack_success_rate": {
-                    "value": round(asr, 2),
-                    "numerator": len(exploits),
-                    "denominator": len(valid),
-                },
-                "defense_blocking_rate": {
-                    "value": round(dbr, 2),
-                    "numerator": len(blocked),
-                    "denominator": len(valid),
-                },
-                "legitimate_task_success_rate": {
-                    "value": round(legitimate_rate, 2),
-                    "numerator": legitimate_passed,
-                    "denominator": legitimate_total,
-                },
-                "test_errors": len(errors),
-            },
+            metrics=payload["metrics"],
             sections={
-                "runs": [r.model_dump(mode="json") for r in trials],
+                "agent_and_environment": payload["agent_and_environment"],
+                "coverage": payload["coverage"],
+                "per_attack": payload["per_attack"],
+                "policies": payload["policies"],
+                "suites": payload["suites"],
                 "regressions": [r.model_dump(mode="json") for r in regressions],
-                "environment": self.environment.environment_id,
+                "runs": [r.model_dump(mode="json") for r in trials],
+                "receipts": self._receipts_for(trials),
+                "indicative_score": metrics.score,
             },
-            limitations=[
-                "A small, controlled attack corpus cannot establish comprehensive security.",
-                "One blocked replay is not a general security guarantee.",
-                "Model output may be nondeterministic; replay is a repeated experiment.",
-                "The MVP protects sandbox test wallets only, never production wallets.",
-            ],
+            limitations=self._limitations(metrics, trials),
         )
         canonical = report.model_dump(mode="json")
         canonical.pop("integrity_hash", None)
@@ -847,6 +1042,78 @@ class Orchestrator:
         ).hexdigest()
         self.store.save_report(report)
         return report
+
+    def _receipts_for(self, trials: list[ScanRun]) -> list[dict[str, Any]]:
+        """FR-RP-03/FR-RE-06: replay receipts recorded for these trials.
+
+        Receipts live on the *replay* runs, which are children of the attack
+        trials rather than the trials themselves. A report covering a scan must
+        therefore follow the replay runs, otherwise the evidence a reader most
+        wants — what happened after the fix — is missing from the report.
+        """
+        receipts: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for trial in trials:
+            candidates = [trial.run_id]
+            candidates.extend(child.run_id for child in self.store.list_child_runs(trial.run_id))
+            for run_id in candidates:
+                if run_id in seen:
+                    continue
+                seen.add(run_id)
+                for record in self.store.list_evidence(run_id):
+                    if record.event_type == "replay_receipt":
+                        receipts.append(record.details)
+        return receipts
+
+    def _suite_descriptors(self, trials: list[ScanRun]) -> list[dict[str, Any]]:
+        """Section 8.6: the suite and versions a report was produced against."""
+        seen: dict[str, dict[str, Any]] = {}
+        for trial in trials:
+            attack = get_attack(trial.attack_id, trial.attack_version)
+            if attack is None:
+                continue
+            seen[attack.attack_id] = {
+                "attack_id": attack.attack_id,
+                "attack_version": attack.version,
+                "name": attack.name,
+                "category": attack.category,
+                "severity": attack.severity,
+                "supported_policy_type": (
+                    attack.supported_policy_type.value
+                    if attack.supported_policy_type
+                    else None
+                ),
+                "source_reference": attack.source_reference,
+            }
+        return [seen[key] for key in sorted(seen)]
+
+    def _limitations(self, metrics, trials: list[ScanRun]) -> list[str]:
+        """NFR-11 / section 9.4: state coverage and scope, not just the wins."""
+        limitations = [
+            "A small, controlled attack corpus cannot establish comprehensive security.",
+            "One blocked replay is not a general security guarantee.",
+            "Model output may be nondeterministic; a replay is a repeated experiment.",
+            "The MVP protects sandbox test wallets only, never production wallets.",
+            "Only recipient-allowlist and maximum-amount rules are supported; other "
+            "attack classes are reported as unsupported rather than fixed.",
+            "Out of scope: compromised hosts, malicious local administrators, and "
+            "compromised model-provider infrastructure.",
+        ]
+        if metrics.test_errors:
+            limitations.append(
+                f"{metrics.test_errors} trial(s) ended in TEST_ERROR and are excluded "
+                "from the rate denominators."
+            )
+        if metrics.not_triggered:
+            limitations.append(
+                f"{metrics.not_triggered} trial(s) did not trigger the attack and are "
+                "not counted as policy blocks."
+            )
+        if metrics.defense_blocking_rate.denominator == 0:
+            limitations.append(
+                "No trial ran with a policy in force, so no blocking rate is reported."
+            )
+        return limitations
 
 
 def _utcnow():

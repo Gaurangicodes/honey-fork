@@ -19,6 +19,7 @@ from ..core.errors import AgentCrashError
 from ..core.models import AgentConfiguration, ErrorCode, ScanRequest
 from ..core.orchestrator import Orchestrator
 from ..core.policy_registry import POLICY_TEMPLATES, template_for
+from ..core.reporting import proof_status
 from ..core.store import Store
 from ..evidence.redaction import redact
 from ..sandbox.manager import SandboxManager, default_demo_environment
@@ -222,15 +223,37 @@ def create_app() -> FastAPI:
             policy_id=body.get("policy_id"),
             legitimate_recipient=body.get("legitimate_recipient"),
             legitimate_amount=body.get("legitimate_amount"),
+            repeat_count=int(body.get("repeat_count", 1)),
         )
         return {
             "replay_run": replay_run.model_dump(mode="json"),
             "regression": regression.model_dump(mode="json"),
-            "proof_status": _proof_status(replay_run, regression),
+            "proof_status": proof_status(replay_run, regression),
             "active_stack": [
                 p.model_dump(mode="json") for p in orchestrator.proxy.active_policies
             ],
         }
+
+    @router.get("/scans/{run_id}/receipt")
+    def get_receipt(run_id: str) -> dict[str, Any]:
+        """FR-RP-03: the replay receipt recorded for a replay run."""
+        _require_run(store, run_id)
+        receipts = [
+            r for r in store.list_evidence(run_id) if r.event_type == "replay_receipt"
+        ]
+        if not receipts:
+            raise AgentCrashError(
+                ErrorCode.REPORT_NOT_FOUND,
+                f"No replay receipt recorded for run {run_id}",
+                resource_id=run_id,
+                status_code=404,
+            )
+        return {"receipt": redact(receipts[-1].details)}
+
+    @router.get("/scans/{run_id}/comparison")
+    def comparison(run_id: str, replay_run_id: str) -> dict[str, Any]:
+        """FR-RP-02: before/after view for a replay of `run_id`."""
+        return redact(orchestrator.comparison(run_id, replay_run_id))
 
     # -- reports -------------------------------------------------------------
     @router.post("/reports")
@@ -303,23 +326,6 @@ def _template_dict(template) -> dict[str, Any]:
         "parameters": list(template.parameters),
         "blocks": template.blocks,
         "legitimate_impact": template.legitimate_impact,
-    }
-
-
-def _proof_status(replay_run, regression) -> dict[str, Any]:
-    """FR-RE-07: proof stamp derived from persisted verifier results."""
-    from ..core.models import FixStatus
-
-    if regression.fix_status is FixStatus.VERIFIED:
-        label = "ATTACK BLOCKED · LEGITIMATE TRANSFER PASSED"
-    else:
-        label = regression.fix_status.value
-    return {
-        "label": label,
-        "fix_status": regression.fix_status.value,
-        "replay_verdict": replay_run.verdict.value if replay_run.verdict else None,
-        "attack_blocked": regression.attack_blocked,
-        "legitimate_task_passed": regression.legitimate_task_passed,
     }
 
 

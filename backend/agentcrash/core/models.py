@@ -315,6 +315,9 @@ class RegressionResult(BaseModel):
     legitimate_task_passed: bool = False
     verification_status: VerificationStatus = VerificationStatus.PENDING
     fix_status: FixStatus = FixStatus.INCOMPLETE
+    # A summary over repeated replay trials. It is not itself a trial, so it
+    # must not be counted alongside the trials it summarises.
+    aggregate: bool = False
     details: dict[str, Any] = Field(default_factory=dict)
 
 
