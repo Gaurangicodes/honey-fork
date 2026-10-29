@@ -8,6 +8,16 @@ A hackathon MVP (Hacker House Goa 2026) implementing the AgentCrash Replay SRS
 v1.0 + v1.1 addendum: an AI-agent security regression loop
 (attack → enforceable policy → replay → legitimate regression).
 
+## Working repository
+
+- Canonical repo is `Gaurangicodes/honey-fork`, default branch `main`. Land work
+  as a branch + PR against that `main`.
+- `GITHUB_TOKEN` is a GitHub App user-to-server token scoped to this repo only.
+  Writes to any other repo fail with 403 "Resource not accessible by
+  integration", and `git push` reports "Permission ... denied".
+- `vanshikayadav404/Honey-Fork` is a separate repo with unrelated history and is
+  not writable with this token. Do not try to push or cross-PR into it.
+
 ## Layout
 
 - `backend/agentcrash/core/` — models, SQLite store, attack library, agent
