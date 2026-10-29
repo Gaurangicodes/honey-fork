@@ -4,6 +4,7 @@ from .agent_registry import AgentRegistry, agent_registry, get_agent
 from .agents import SandboxAgent
 from .attacks import SAFE_TRANSFER_LIMIT, all_attacks, get_attack
 from .errors import AgentCrashError, ReplayStateMismatch, SandboxUnavailable
+from .hashing import canonical_hash, integrity_hash, verify_integrity
 from .policy import PolicyCompiler, PolicyProxy, format_amount, normalize_address
 from .policy_registry import (
     POLICY_TEMPLATES,
@@ -47,6 +48,7 @@ __all__ = [
     "all_attacks",
     "build_receipt",
     "build_report_payload",
+    "canonical_hash",
     "compute_metrics",
     "estimated_exposure",
     "execute_wallet_action",
@@ -54,9 +56,11 @@ __all__ = [
     "get_agent",
     "get_attack",
     "indicative_score",
+    "integrity_hash",
     "normalize_address",
     "per_attack_breakdown",
     "proof_status",
     "supported_policy_types",
     "template_for",
+    "verify_integrity",
 ]

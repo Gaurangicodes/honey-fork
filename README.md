@@ -30,11 +30,12 @@ branches and are merged to `main` as they pass their acceptance gate.
 | 3 | Policy generation & enforcement (allowlist, max amount, proxy) | done |
 | 4 | Replay, regression, scoring & reporting | done |
 | 5 | Dashboard & scan orchestration | done |
-| 6 | Persistence & evidence management | partial |
+| 6 | Persistence & evidence management | done |
 
-Modules 3, 4 and 6 are implemented to the minimum needed to exercise the
-Module 1/2 proof loop end to end (attack → policy → replay → legitimate
-regression).
+Every module implements its SRS acceptance criteria. Scope that the SRS marks
+P1/P2 (partner integrations, hosted reports, billing) is deliberately absent;
+`GET /api/evidence/integrity` is an integrity check over stored records, not a
+signature or an audit.
 
 ## Running the dashboard
 

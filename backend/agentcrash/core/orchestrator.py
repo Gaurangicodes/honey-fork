@@ -8,15 +8,15 @@ every outcome comes from `OutcomeVerifier` reading receipts and balances.
 
 from __future__ import annotations
 
-import hashlib
-import json
 from typing import Any
 
 from .agents import SandboxAgent
 from .agent_registry import AgentRegistry
 from .attacks import SAFE_TRANSFER_LIMIT, get_attack
 from .errors import AgentCrashError, ReplayStateMismatch
+from .hashing import integrity_hash
 from .models import (
+    AttackDefinition,
     ErrorCode,
     EvidenceRecord,
     FixStatus,
@@ -88,11 +88,13 @@ class Orchestrator:
         return event
 
     def _evidence(self, run: ScanRun, record: EvidenceRecord) -> None:
-        canonical = record.model_dump(mode="json")
-        canonical.pop("integrity_hash", None)
-        record.integrity_hash = "0x" + hashlib.sha256(
-            json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
+        """FR-DB-04: stamp the integrity digest, then persist.
+
+        Every evidence record goes through here, including replay receipts, so
+        no record can be stored unstamped. The digest covers the record's
+        canonical body with the digest field itself removed.
+        """
+        record.integrity_hash = integrity_hash(record)
         self.store.save_evidence(record)
 
     # -- attack runs ---------------------------------------------------------
@@ -179,6 +181,9 @@ class Orchestrator:
             environment_id=self.environment.environment_id,
         )
         self.store.save_run(trial)
+        # FR-DB-03: snapshot the exact definition version this run executes, so
+        # a later edit to the attack library cannot change what this run means.
+        self.store.save_attack_definition(attack)
         self._emit(
             trial,
             "payload_received",
@@ -356,7 +361,7 @@ class Orchestrator:
         return policies[0] if policies else None
 
     def _propose_for_run(self, run: ScanRun) -> Policy | None:
-        attack = get_attack(run.attack_id, run.attack_version)
+        attack = self._resolve_attack(run)
         if attack is None:
             raise AgentCrashError(
                 ErrorCode.ATTACK_NOT_FOUND, f"No attack {run.attack_id}", resource_id=run.attack_id
@@ -369,13 +374,58 @@ class Orchestrator:
         }
         # Version numbers are per policy type (FR-DB-02), so "allowlist v2" stays
         # unambiguous even when amount-cap versions exist alongside it.
-        existing = self.policies.history(attack.supported_policy_type)
+        version = self.policies.next_version(attack.supported_policy_type)
         policy = self.compiler.compile(
-            attack=attack, run_id=run.run_id, observed=observed, existing_versions=len(existing)
+            attack=attack, run_id=run.run_id, observed=observed, existing_versions=int(version) - 1
         )
-        if policy is not None:
-            self.store.save_policy(policy)
+        if policy is None:
+            return None
+        # FR-DB-02: proposing the same fix again returns the open proposal
+        # instead of minting a new version, so repeated clicks cannot inflate
+        # the version of the rule the operator eventually applies.
+        equivalent = self.policies.find_proposed_equivalent(policy)
+        if equivalent is not None:
+            return equivalent
+        self.store.save_policy(policy)
         return policy
+
+    # -- attack resolution (FR-DB-03) ----------------------------------------
+    def _resolve_attack(self, run: ScanRun) -> AttackDefinition | None:
+        """The exact attack definition a run executed.
+
+        FR-DB-03: a run references the definition version it ran, so resolving
+        must prefer that version. The in-process library is the source of truth
+        while it still holds the version; once the library is edited (a payload
+        fixed, a version bumped) the persisted snapshot is what the run actually
+        executed, and the run must still resolve to it rather than to the new
+        text or to nothing at all.
+        """
+        attack = get_attack(run.attack_id, run.attack_version)
+        if attack is not None:
+            return attack
+        return self.store.get_attack_definition(run.attack_id, run.attack_version)
+
+    def _unresolved_attack_descriptor(self, run: ScanRun) -> dict[str, Any]:
+        """FR-DB-03/NFR-11: describe an attack whose definition is gone.
+
+        Reported explicitly rather than omitted, because a silently missing
+        entry would make a report look narrower than the run it describes.
+        """
+        return {
+            "attack_id": run.attack_id,
+            "attack_version": run.attack_version,
+            "name": run.attack_id,
+            "category": "unknown",
+            "severity": None,
+            "supported_policy_type": None,
+            "source_reference": "",
+            "definition_available": False,
+            "note": (
+                "The attack definition for this version is no longer available; "
+                "the run and its verdict are preserved but the test text cannot "
+                "be reproduced from this report."
+            ),
+        }
 
     # -- run resolution ------------------------------------------------------
     def _trials_for(self, run_id: str) -> list[ScanRun]:
@@ -701,7 +751,7 @@ class Orchestrator:
                 "Restored state fingerprint does not match the original baseline"
             )
 
-        attack = get_attack(original.attack_id, original.attack_version)
+        attack = self._resolve_attack(original)
         if attack is None:
             raise AgentCrashError(
                 ErrorCode.ATTACK_NOT_FOUND, f"No attack {original.attack_id}"
@@ -817,13 +867,14 @@ class Orchestrator:
             agent_config=agent_config,
             active_policies=self.proxy.active_policies,
         )
-        self.store.save_evidence(
+        self._evidence(
+            replay_run,
             EvidenceRecord(
                 run_id=replay_run.run_id,
                 event_type="replay_receipt",
                 status=regression.fix_status.value,
                 details=receipt,
-            )
+            ),
         )
         self._emit(
             replay_run,
@@ -1035,11 +1086,7 @@ class Orchestrator:
             },
             limitations=self._limitations(metrics, trials),
         )
-        canonical = report.model_dump(mode="json")
-        canonical.pop("integrity_hash", None)
-        report.integrity_hash = "0x" + hashlib.sha256(
-            json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
+        report.integrity_hash = integrity_hash(report)
         self.store.save_report(report)
         return report
 
@@ -1050,6 +1097,9 @@ class Orchestrator:
         trials rather than the trials themselves. A report covering a scan must
         therefore follow the replay runs, otherwise the evidence a reader most
         wants — what happened after the fix — is missing from the report.
+
+        FR-DB-04: each receipt carries the digest of the evidence record that
+        holds it, so an exported report can be checked against the store.
         """
         receipts: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -1062,17 +1112,28 @@ class Orchestrator:
                 seen.add(run_id)
                 for record in self.store.list_evidence(run_id):
                     if record.event_type == "replay_receipt":
-                        receipts.append(record.details)
+                        receipts.append(
+                            {**record.details, "integrity_hash": record.integrity_hash}
+                        )
         return receipts
 
     def _suite_descriptors(self, trials: list[ScanRun]) -> list[dict[str, Any]]:
-        """Section 8.6: the suite and versions a report was produced against."""
+        """Section 8.6: the suite and versions a report was produced against.
+
+        FR-DB-03: an attack whose definition has since been edited out of the
+        library is reported as unavailable rather than skipped. Dropping it
+        would understate the suite a report covers.
+        """
         seen: dict[str, dict[str, Any]] = {}
         for trial in trials:
-            attack = get_attack(trial.attack_id, trial.attack_version)
-            if attack is None:
+            key = f"{trial.attack_id}@{trial.attack_version}"
+            if key in seen:
                 continue
-            seen[attack.attack_id] = {
+            attack = self._resolve_attack(trial)
+            if attack is None:
+                seen[key] = self._unresolved_attack_descriptor(trial)
+                continue
+            seen[key] = {
                 "attack_id": attack.attack_id,
                 "attack_version": attack.version,
                 "name": attack.name,
@@ -1084,6 +1145,7 @@ class Orchestrator:
                     else None
                 ),
                 "source_reference": attack.source_reference,
+                "definition_available": True,
             }
         return [seen[key] for key in sorted(seen)]
 

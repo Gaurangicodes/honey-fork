@@ -163,6 +163,46 @@ not a style issue.
 - Applying a policy must refetch `/health`; the header's enforced stack comes
   from there, and nothing else invalidates it.
 
+## Module 6 notes (persistence & evidence management)
+
+- `core/hashing.py` is the **only** place canonical JSON and SHA-256 live.
+  `canonical_hash` is for fingerprints; `integrity_hash` is for record digests
+  and always excludes the record's own `integrity_hash` field, so a digest can
+  be recomputed from the stored body. Do not hand-roll `hashlib.sha256` again —
+  five copies existed before this module and they had drifted.
+- **Every** evidence record is stamped through `Orchestrator._evidence`. The
+  replay receipt previously called `store.save_evidence` directly and was
+  persisted with `integrity_hash=None`, which made the single most important
+  artifact the one record a reader could not check (FR-DB-04).
+- `verify_integrity(record)` recomputes the digest; `GET /api/evidence/integrity`
+  sweeps the store. This detects later modification of a stored record. It is an
+  integrity check, **not** a signature, and the endpoint's `note` says so.
+- Attack definitions are snapshotted into the `attacks` table when a run
+  executes, and the whole library is seeded at startup. `_resolve_attack` reads
+  the in-process library first, then the snapshot. This is what lets a report
+  still name `AT-01@1.0.0` after the library is edited (FR-DB-03). A stored
+  `(attack_id, version)` is never overwritten, and `_suite_descriptors` reports
+  an unresolvable attack as `definition_available: false` rather than dropping
+  it from the suite.
+- Policy versions are per type and **max+1**, not `len()+1`: versions go sparse
+  once a proposal is superseded, and counting reissues a number history already
+  uses. `find_proposed_equivalent` makes proposing the same rule twice return
+  the open proposal instead of minting a version, so the first rule an operator
+  applies reads as v1 rather than v7 (FR-DB-02).
+- **Redaction is context-aware, and that matters.** A bare `0x` + 64 hex value
+  is both a transaction hash and a private key. `redact()` uses the field name:
+  a value under `hash`/`tx`/`transaction`/`digest`/`evidence_id`/`snapshot_id`
+  is preserved as evidence (section 24 requires the dashboard to show it); a
+  value under a credential field is dropped; free text via `redact_text` keeps
+  the strict rule. Blanket-redacting every 64-hex value silently replaced every
+  transaction hash in the UI with `[REDACTED]`.
+- All read endpoints (`/scans`, `/scans/{id}`, `/events`, `/trials`, `/policies`,
+  receipts, agent configs) serialize through the local `_out` helper, so
+  redaction happens at the response boundary rather than only on the report path.
+- Run IDs are unique and never rewritten; a failed run is retained with its
+  error code. `manager.reset()` restores balances and **never** touches stored
+  runs, reports or evidence.
+
 ## Gotchas
 
 - `SimulatedChain` is the default sandbox; `AnvilChain` is optional and only

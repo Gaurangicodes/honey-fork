@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from .models import (
     AgentConfiguration,
+    AttackDefinition,
     EnvironmentSnapshot,
     EvidenceRecord,
     Policy,
@@ -94,6 +95,15 @@ CREATE TABLE IF NOT EXISTS agent_configs (
     agent_id TEXT PRIMARY KEY,
     payload TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS attacks (
+    attack_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    test_status TEXT,
+    payload TEXT NOT NULL,
+    PRIMARY KEY (attack_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_attacks_id ON attacks(attack_id);
 """
 
 
@@ -242,6 +252,24 @@ class Store:
         ).fetchall()
         return [EvidenceRecord.model_validate_json(r["payload"]) for r in rows]
 
+    def get_evidence(self, evidence_id: str) -> EvidenceRecord | None:
+        row = self._conn.execute(
+            "SELECT payload FROM evidence WHERE evidence_id=?", (evidence_id,)
+        ).fetchone()
+        return EvidenceRecord.model_validate_json(row["payload"]) if row else None
+
+    def list_all_evidence(self, limit: int = 500) -> list[EvidenceRecord]:
+        """FR-DB-01: every stored record, newest first.
+
+        Used by the integrity sweep: evidence is only useful if a reader can
+        recheck a digest after the fact, which needs the whole set rather than
+        one run's slice.
+        """
+        rows = self._conn.execute(
+            "SELECT payload FROM evidence ORDER BY rowid DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [EvidenceRecord.model_validate_json(r["payload"]) for r in rows]
+
     # -- events --------------------------------------------------------------
     def save_event(self, event: RunEvent) -> None:
         self._conn.execute(
@@ -322,3 +350,51 @@ class Store:
             "SELECT payload FROM agent_configs ORDER BY rowid ASC"
         ).fetchall()
         return [AgentConfiguration.model_validate_json(r["payload"]) for r in rows]
+
+    # -- attack definitions (FR-AT-01, FR-DB-03) ------------------------------
+    def save_attack_definition(self, attack: AttackDefinition) -> None:
+        """Persist an attack definition version.
+
+        FR-DB-03: a run references the exact definition version it executed.
+        The library is editable during development, so the executed definition is
+        snapshotted here; editing a test case afterwards then cannot silently
+        change an existing report.
+
+        A stored version is never overwritten. If the same (attack_id, version)
+        is registered twice with different content, the first write wins and the
+        duplicate is ignored, so history stays stable.
+        """
+        self._conn.execute(
+            """INSERT INTO attacks (attack_id, version, test_status, payload)
+               VALUES (?,?,?,?)
+               ON CONFLICT(attack_id, version) DO NOTHING""",
+            (
+                attack.attack_id,
+                attack.version,
+                attack.test_status,
+                attack.model_dump_json(),
+            ),
+        )
+        self._conn.commit()
+
+    def get_attack_definition(
+        self, attack_id: str, version: str | None = None
+    ) -> AttackDefinition | None:
+        """The persisted definition, newest version when `version` is omitted."""
+        if version is not None:
+            row = self._conn.execute(
+                "SELECT payload FROM attacks WHERE attack_id=? AND version=?",
+                (attack_id, version),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT payload FROM attacks WHERE attack_id=? ORDER BY rowid DESC LIMIT 1",
+                (attack_id,),
+            ).fetchone()
+        return AttackDefinition.model_validate_json(row["payload"]) if row else None
+
+    def list_attack_definitions(self) -> list[AttackDefinition]:
+        rows = self._conn.execute(
+            "SELECT payload FROM attacks ORDER BY rowid ASC"
+        ).fetchall()
+        return [AttackDefinition.model_validate_json(r["payload"]) for r in rows]
