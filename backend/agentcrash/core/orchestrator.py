@@ -12,7 +12,8 @@ import hashlib
 import json
 from typing import Any
 
-from .agents import SandboxAgent, get_agent
+from .agents import SandboxAgent
+from .agent_registry import AgentRegistry
 from .attacks import SAFE_TRANSFER_LIMIT, get_attack
 from .errors import AgentCrashError, ReplayStateMismatch
 from .models import (
@@ -33,6 +34,7 @@ from .models import (
 )
 from .policy import PolicyCompiler, PolicyProxy
 from .store import Store
+from .tools import ToolRegistry
 from .wallet import execute_wallet_action
 from ..sandbox.manager import SandboxEnvironment, SandboxManager
 from ..sandbox.verifier import OutcomeVerifier, error_result
@@ -45,11 +47,15 @@ class Orchestrator:
         environment: SandboxEnvironment,
         manager: SandboxManager,
         compiler: PolicyCompiler | None = None,
+        agents: AgentRegistry | None = None,
+        tools: ToolRegistry | None = None,
     ) -> None:
         self.store = store
         self.environment = environment
         self.manager = manager
         self.compiler = compiler or PolicyCompiler()
+        self.tools = tools or ToolRegistry()
+        self.agents = agents or AgentRegistry(tools=self.tools)
         self.verifier = OutcomeVerifier(
             unauthorized_recipient=environment.unauthorized_recipient,
             token_contract=environment.token_contract,
@@ -80,7 +86,7 @@ class Orchestrator:
     # -- attack runs ---------------------------------------------------------
     def start_scan(self, agent_id: str, attack_ids: list[str], repeat_count: int) -> ScanRun:
         """FR-UI-02: validate, then run each attack `repeat_count` times."""
-        agent = get_agent(agent_id)
+        agent = self.agents.get(agent_id)
         if agent is None:
             raise AgentCrashError(
                 ErrorCode.AGENT_NOT_FOUND, f"Unknown agent {agent_id}", resource_id=agent_id
@@ -118,7 +124,7 @@ class Orchestrator:
         Kept separate from `start_scan` so the API can return a run id
         immediately and the work can proceed in the background.
         """
-        agent_config = get_agent(parent_run.agent_id)
+        agent_config = self.agents.get(parent_run.agent_id)
         assert agent_config is not None  # validated in start_scan
         trials: list[ScanRun] = []
         try:
@@ -143,7 +149,7 @@ class Orchestrator:
         return trials
 
     def _run_single_trial(self, *, parent: ScanRun, attack, trial_index: int) -> ScanRun:
-        agent_config = get_agent(parent.agent_id)
+        agent_config = self.agents.get(parent.agent_id)
         assert agent_config is not None
         enforce = agent_config.guardrail == "policy_proxy"
 
@@ -179,8 +185,35 @@ class Orchestrator:
         trial.environment_snapshot_id = before.snapshot_id
         self.store.save_snapshot(before)
 
-        agent = SandboxAgent(agent_config)
+        agent = SandboxAgent(agent_config, self.tools)
         try:
+            # FR-AT-05: reach the payload through the registered tools only, so a
+            # malicious-tool scenario runs a controlled mock. Observations are
+            # recorded as evidence, including any rejected (unregistered) call.
+            observations = agent.gather_observations(attack)
+            for observation in observations:
+                trial.tool_calls.append(
+                    {
+                        "tool": observation.tool_id,
+                        "arguments": observation.arguments,
+                        "ok": observation.ok,
+                        "rejected": observation.rejected,
+                        "rejection_reason": observation.rejection_reason,
+                    }
+                )
+                self._emit(
+                    trial,
+                    "tool_result_rejected" if observation.rejected else "tool_result",
+                    (
+                        observation.rejection_reason
+                        if observation.rejected
+                        else f"{observation.tool_id} returned an observation"
+                    ),
+                    tool=observation.tool_id,
+                    ok=observation.ok,
+                    rejected=observation.rejected,
+                    output=observation.output,
+                )
             action = agent.propose_action(
                 attack,
                 sender=self.environment.agent_address,
@@ -188,6 +221,7 @@ class Orchestrator:
                 chain_id=self.environment.chain.chain_id,
                 unauthorized_recipient=self.environment.unauthorized_recipient,
                 decimals=self.environment.decimals,
+                observations=observations,
             )
         except Exception as exc:
             return self._finalize_error(trial, before, f"Agent runtime error: {exc}")
@@ -457,7 +491,7 @@ class Orchestrator:
             raise AgentCrashError(
                 ErrorCode.ATTACK_NOT_FOUND, f"No attack {original.attack_id}"
             )
-        agent_config = get_agent(original.agent_id)
+        agent_config = self.agents.get(original.agent_id)
         assert agent_config is not None
 
         replay_run = ScanRun(
@@ -481,7 +515,18 @@ class Orchestrator:
             fingerprint=restored.fingerprint(),
         )
 
-        agent = SandboxAgent(agent_config)
+        agent = SandboxAgent(agent_config, self.tools)
+        observations = agent.gather_observations(attack)
+        for observation in observations:
+            replay_run.tool_calls.append(
+                {
+                    "tool": observation.tool_id,
+                    "arguments": observation.arguments,
+                    "ok": observation.ok,
+                    "rejected": observation.rejected,
+                    "rejection_reason": observation.rejection_reason,
+                }
+            )
         action = agent.propose_action(
             attack,
             sender=self.environment.agent_address,
@@ -489,6 +534,7 @@ class Orchestrator:
             chain_id=self.environment.chain.chain_id,
             unauthorized_recipient=self.environment.unauthorized_recipient,
             decimals=self.environment.decimals,
+            observations=observations,
         )
         attack_triggered = action is not None
         receipts = []

@@ -15,6 +15,7 @@ from typing import TypeVar
 from pydantic import BaseModel
 
 from .models import (
+    AgentConfiguration,
     EnvironmentSnapshot,
     EvidenceRecord,
     Policy,
@@ -86,6 +87,11 @@ CREATE INDEX IF NOT EXISTS idx_regressions_original ON regressions(original_run_
 
 CREATE TABLE IF NOT EXISTS reports (
     report_id TEXT PRIMARY KEY,
+    payload TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_configs (
+    agent_id TEXT PRIMARY KEY,
     payload TEXT NOT NULL
 );
 """
@@ -283,3 +289,24 @@ class Store:
             "SELECT payload FROM reports ORDER BY rowid DESC"
         ).fetchall()
         return [Report.model_validate_json(r["payload"]) for r in rows]
+
+    # -- agent configurations (FR-AG-01) -------------------------------------
+    def save_agent_config(self, config: AgentConfiguration) -> None:
+        self._conn.execute(
+            """INSERT INTO agent_configs (agent_id, payload) VALUES (?,?)
+               ON CONFLICT(agent_id) DO UPDATE SET payload=excluded.payload""",
+            (config.agent_id, config.model_dump_json()),
+        )
+        self._conn.commit()
+
+    def get_agent_config(self, agent_id: str) -> AgentConfiguration | None:
+        row = self._conn.execute(
+            "SELECT payload FROM agent_configs WHERE agent_id=?", (agent_id,)
+        ).fetchone()
+        return AgentConfiguration.model_validate_json(row["payload"]) if row else None
+
+    def list_agent_configs(self) -> list[AgentConfiguration]:
+        rows = self._conn.execute(
+            "SELECT payload FROM agent_configs ORDER BY rowid ASC"
+        ).fetchall()
+        return [AgentConfiguration.model_validate_json(r["payload"]) for r in rows]

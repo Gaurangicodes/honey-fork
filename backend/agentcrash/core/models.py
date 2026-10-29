@@ -56,6 +56,14 @@ class PolicyType(str, Enum):
     MAX_AMOUNT = "max_transaction_amount"
 
 
+class ToolKind(str, Enum):
+    """FR-AG-03: capability class of a registered sandbox tool."""
+
+    WALLET = "wallet"
+    READ = "read"
+    MOCK = "mock"
+
+
 class PolicyStatus(str, Enum):
     PROPOSED = "proposed"
     APPLIED = "applied"
@@ -108,6 +116,41 @@ class AgentConfiguration(BaseModel):
     guardrail: Literal["none", "system_prompt_only", "policy_proxy"] = "none"
     description: str = ""
     initial_balance: int = 0
+    system_instructions: str = ""
+    registered_at: datetime = Field(default_factory=utcnow)
+
+
+class ToolDefinition(BaseModel):
+    """FR-AG-03: an explicitly registered sandbox tool.
+
+    A tool exists only if it appears in the registry. Anything absent from the
+    registry cannot be invoked, which is what makes "attempts to use
+    unregistered tools are rejected" a mechanical property rather than a
+    convention.
+    """
+
+    tool_id: str
+    kind: ToolKind
+    description: str = ""
+    # Whether a wallet tool reaches the sandbox directly or through the proxy.
+    # Only ``wallet`` tools carry this; it is the enforcement boundary (FR-PL-03).
+    requires_policy_proxy: bool = True
+
+
+class ToolCallResult(BaseModel):
+    """FR-AT-03 / FR-AT-05: the structured record of one tool invocation.
+
+    A rejected call is a recorded result, not an exception: an attempt to use an
+    unregistered tool is evidence, and it must never be mistaken for a security
+    outcome.
+    """
+
+    tool_id: str
+    ok: bool
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    output: dict[str, Any] | None = None
+    rejected: bool = False
+    rejection_reason: str = ""
 
 
 class AttackDefinition(BaseModel):
@@ -120,6 +163,14 @@ class AttackDefinition(BaseModel):
     description: str = ""
     input_payload: str
     target_capability: str = "wallet.transfer"
+    # Tools the payload is expected to drive, in order (FR-AT-01/FR-AT-05). The
+    # runner invokes these through the registry so a malicious-tool scenario
+    # exercises a controlled mock rather than real code.
+    tools_used: list[str] = Field(default_factory=list)
+    # Canned outputs injected for `tools_used`, keyed by tool id. This is how a
+    # malicious-tool-response scenario delivers its injection: the tool itself
+    # returns the untrusted text (FR-AT-02, FR-AT-05).
+    tool_outputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
     expected_legitimate_behavior: str = ""
     expected_unsafe_behavior: str = ""
     success_condition: str

@@ -14,9 +14,9 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from ..core.agents import agent_registry
-from ..core.attacks import all_attacks
+from ..core.attacks import all_attacks, get_attack
 from ..core.errors import AgentCrashError
-from ..core.models import ErrorCode, ScanRequest
+from ..core.models import AgentConfiguration, ErrorCode, ScanRequest
 from ..core.orchestrator import Orchestrator
 from ..core.store import Store
 from ..evidence.redaction import redact
@@ -28,6 +28,11 @@ def build_state() -> tuple[Store, Orchestrator, SandboxManager]:
     environment = default_demo_environment()
     manager = SandboxManager(environment)
     orchestrator = Orchestrator(store, environment, manager)
+    # Seed the persisted agent registry so a registered configuration survives a
+    # restart and is visible in the dashboard (FR-AG-01).
+    for config in agent_registry():
+        if store.get_agent_config(config.agent_id) is None:
+            store.save_agent_config(config)
     return store, orchestrator, manager
 
 
@@ -62,11 +67,41 @@ def create_app() -> FastAPI:
     # -- agents & attacks ----------------------------------------------------
     @router.get("/agents")
     def list_agents() -> list[dict[str, Any]]:
-        return [a.model_dump(mode="json") for a in agent_registry()]
+        return [a.model_dump(mode="json") for a in store.list_agent_configs()]
+
+    @router.post("/agents", status_code=201)
+    def register_agent(config: AgentConfiguration) -> dict[str, Any]:
+        """FR-AG-01: register a sandbox agent configuration."""
+        registered = orchestrator.agents.register(config)
+        store.save_agent_config(registered)
+        return {"agent": registered.model_dump(mode="json")}
+
+    @router.get("/agents/{agent_id}")
+    def get_agent_config(agent_id: str) -> dict[str, Any]:
+        config = store.get_agent_config(agent_id) or orchestrator.agents.get(agent_id)
+        if config is None:
+            raise AgentCrashError(
+                ErrorCode.AGENT_NOT_FOUND, f"Unknown agent {agent_id}", resource_id=agent_id
+            )
+        return {"agent": config.model_dump(mode="json")}
+
+    @router.get("/tools")
+    def list_tools() -> list[dict[str, Any]]:
+        """FR-AG-03: the only tools an agent may invoke."""
+        return [t.model_dump(mode="json") for t in orchestrator.tools.list_tools()]
 
     @router.get("/attacks")
     def list_attacks() -> list[dict[str, Any]]:
         return [a.model_dump(mode="json") for a in all_attacks()]
+
+    @router.get("/attacks/{attack_id}")
+    def get_attack_detail(attack_id: str) -> dict[str, Any]:
+        attack = get_attack(attack_id)
+        if attack is None:
+            raise AgentCrashError(
+                ErrorCode.ATTACK_NOT_FOUND, f"Unknown attack {attack_id}", resource_id=attack_id
+            )
+        return {"attack": attack.model_dump(mode="json")}
 
     # -- scans ---------------------------------------------------------------
     @router.post("/scans")
