@@ -26,8 +26,11 @@ v1.0 + v1.1 addendum: an AI-agent security regression loop
 - `backend/agentcrash/sandbox/` — chain adapters, sandbox manager, independent
   verifier.
 - `backend/agentcrash/api/` — FastAPI app (SRS section 7 endpoints).
+- `backend/agentcrash/integrations/` — optional ecosystem adapters (Socket,
+  TigerGraph, Wispr Flow, Dodo Payments). Off by default; see Module 7 notes.
 - `backend/tests/` — pytest suite (`test_agent_module1.py`,
-  `test_sandbox_module2.py`, `test_pipeline_e2e.py`).
+  `test_sandbox_module2.py`, `test_integrations_module7.py`,
+  `test_pipeline_e2e.py`).
 - `frontend/src/` — dashboard. `types.ts` mirrors the API shapes, `api.ts` is
   the only place that talks HTTP, `format.ts` owns presentation and
   `components/` holds the panels. `format.test.ts` covers the pure logic.
@@ -37,7 +40,7 @@ v1.0 + v1.1 addendum: an AI-agent security regression loop
 ```bash
 cd backend
 pip install -r requirements.txt
-python -m pytest                                  # 132 tests
+python -m pytest                                  # 195 tests
 uvicorn agentcrash.api.app:app --port 8123        # run API
 python scripts/demo_flow.py                       # live end-to-end proof (needs API running)
 python -m pyflakes agentcrash tests scripts       # lint
@@ -74,6 +77,15 @@ not a style issue.
    attack payload *plus* the rendered tool observations, which is why AT-01/AT-02
    can steer the agent through a mock tool. Never treat a tool response as
    trusted.
+9. **An optional adapter never fabricates a result and never controls
+   anything.** `AdapterResult` raises unless findings carry state `ok`, so a
+   disabled/unconfigured/errored adapter cannot be rendered as a clean scan.
+   Adapters return data only: none can approve a policy, sign a transaction or
+   alter a verdict. The core proof runs with every adapter off (FR-INT-01).
+10. **Voice cannot approve or authorise.** `VOICE_OPERATIONS` contains no
+    apply/sign/transfer operation, and `FORBIDDEN_PATTERNS` refuses such
+    transcripts with an explanation. Do not add an operation that voice could
+    use to move funds or change a policy (FR-INT-04).
 
 ## Module 1 notes (agent & attack management)
 
@@ -202,6 +214,41 @@ not a style issue.
 - Run IDs are unique and never rewritten; a failed run is retained with its
   error code. `manager.reset()` restores balances and **never** touches stored
   runs, reports or evidence.
+
+## Module 7 notes (optional ecosystem adapters)
+
+- `integrations/base.py` is the contract. An adapter is constructed always (so
+  the dashboard can show its flag and setup steps) but `enabled` requires both
+  `AGENTCRASH_INTEGRATIONS_ENABLED` and its own flag to be truthy. Presence of a
+  credential alone starts nothing.
+- `AdapterResult.__post_init__` rejects findings on any state but `ok`. That is
+  the structural half of FR-INT-02 — the reason a "not run" adapter can never be
+  presented as a clean scan. Do not weaken it to make a call site simpler.
+- `Integration.unavailable()` is the honest "did not run" path. Every capability
+  method returns it when `state() is not OK`, before touching the network.
+- Socket parses the NDJSON stream by hand (`_parse_ndjson`). Two synthetic alert
+  types matter: `pendingScan` and `notFound`. An unresolved package is reported
+  as a finding, never dropped, because "we could not resolve this" is a real
+  result and must not read as clean.
+- TigerGraph's `build_upsert_payload` projects the **persisted** `RunEvent`
+  shape: a flat envelope (`run_id`, `event_id`, `seq`, `event_type`) with detail
+  nested under `data`. It sorts by `seq`, so input order does not matter, and it
+  attaches a `policy_decision`/`transaction_receipt` to the most recent
+  `tool_call` in that run — the order the orchestrator emitted them in. A
+  blocked trial emits a decision with **no** tool call, so the decision edges
+  from the `Run` (`RUN_HAS_POLICY_DECISION`) rather than from a `ToolCall`, and
+  a blocked trial yields no `Transaction` vertex. Never add placeholder nodes to
+  make the graph look complete (same rule as FR-UX-08).
+- Wispr Flow has no public API. The adapter is a guarded input source: `parse()`
+  recognises and refuses, `execute()` is the only path that marks a command
+  confirmed, and neither can approve a policy. Keep it that way.
+- Dodo is read-only by design (SRS 25, P2). `payment_summary()` reads counts and
+  statuses only — no amounts, no customer emails, no payment ids (NFR-07) — and
+  performs no charge. A key whose prefix disagrees with `DODO_PAYMENTS_MODE` is
+  an error, not a silent redirect to live.
+- Adapter tests inject an `httpx.MockTransport`, so the real request building,
+  NDJSON parsing, projection and error handling run unmodified. Do not replace
+  this with a mock of the adapter's own logic.
 
 ## Gotchas
 

@@ -6,6 +6,9 @@ export default defineConfig({
   server: {
     host: true,
     port: 12000,
+    // The runtime serves the dev server through a proxied hostname, so the
+    // preview origin must be allowed explicitly or Vite answers with 403.
+    allowedHosts: [".prod-runtime.all-hands.dev"],
     // The dashboard talks to the FastAPI backend on its own port. Proxying
     // keeps the browser on one origin, so no CORS configuration is needed and
     // the backend never has to be exposed directly.

@@ -212,3 +212,54 @@ export interface ScanAccepted {
   completed_trials: number;
   trial_run_ids: string[];
 }
+
+// -- optional ecosystem adapters (SRS 20.6, FR-INT-01..05) -------------------
+
+export type IntegrationState =
+  | "disabled"
+  | "not_configured"
+  | "ok"
+  | "error"
+  | "unsupported";
+
+export interface SetupStep {
+  description: string;
+  env_var: string | null;
+  example: string | null;
+}
+
+export interface IntegrationStatus {
+  adapter: string;
+  role: string;
+  priority: string;
+  state: IntegrationState;
+  enabled: boolean;
+  flag: string;
+  configured: boolean;
+  /** Variable names only. The API never sends credential values. */
+  required_config: string[];
+  missing_config: string[];
+  docs_url: string;
+  acceptance: string;
+  detail: string;
+  setup: SetupStep[];
+}
+
+export interface IntegrationSummary {
+  integrations: IntegrationStatus[];
+  counts: Record<string, number>;
+  any_enabled: boolean;
+  note: string;
+}
+
+export interface AdapterResult {
+  adapter: string;
+  state: IntegrationState;
+  detail: string;
+  reason: string;
+  /** True only when a real call produced real data. */
+  ran: boolean;
+  findings: Record<string, unknown>[];
+  meta: Record<string, unknown>;
+  error_code: string | null;
+}
