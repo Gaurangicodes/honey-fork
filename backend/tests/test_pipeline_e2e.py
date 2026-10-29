@@ -3,22 +3,13 @@
 from __future__ import annotations
 
 import pytest
-from fastapi.testclient import TestClient
 
-from agentcrash.api.app import create_app
 from agentcrash.core.models import (
     FixStatus,
     PolicyType,
     Verdict,
 )
 from agentcrash.evidence.redaction import redact, redact_text
-
-
-@pytest.fixture()
-def client(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    with TestClient(create_app()) as c:
-        yield c
 
 
 # -- E2E-01 / FR-UI-02 ------------------------------------------------------
