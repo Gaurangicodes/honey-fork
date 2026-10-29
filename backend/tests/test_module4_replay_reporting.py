@@ -412,7 +412,7 @@ def test_aggregate_summary_is_not_counted_as_an_extra_trial(orchestrator):
 
 def test_receipt_and_comparison_endpoints(client):
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-01"], "repeat_count": 1},
     ).json()["run_id"]
     trials = client.get(f"/api/scans/{run_id}/trials").json()
@@ -441,7 +441,7 @@ def test_receipt_and_comparison_endpoints(client):
 
 def test_receipt_endpoint_404s_when_no_receipt_exists(client):
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-01"], "repeat_count": 1},
     ).json()["run_id"]
     trials = client.get(f"/api/scans/{run_id}/trials").json()
@@ -451,7 +451,7 @@ def test_receipt_endpoint_404s_when_no_receipt_exists(client):
 
 def test_report_export_includes_new_sections_without_secrets(client):
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-01"], "repeat_count": 1},
     ).json()["run_id"]
     report_id = client.post("/api/reports", json={"run_ids": [run_id]}).json()["report"][

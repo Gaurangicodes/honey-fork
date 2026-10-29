@@ -28,6 +28,9 @@ v1.0 + v1.1 addendum: an AI-agent security regression loop
 - `backend/agentcrash/api/` — FastAPI app (SRS section 7 endpoints).
 - `backend/tests/` — pytest suite (`test_agent_module1.py`,
   `test_sandbox_module2.py`, `test_pipeline_e2e.py`).
+- `frontend/src/` — dashboard. `types.ts` mirrors the API shapes, `api.ts` is
+  the only place that talks HTTP, `format.ts` owns presentation and
+  `components/` holds the panels. `format.test.ts` covers the pure logic.
 
 ## Commands
 
@@ -38,6 +41,11 @@ python -m pytest                                  # 132 tests
 uvicorn agentcrash.api.app:app --port 8123        # run API
 python scripts/demo_flow.py                       # live end-to-end proof (needs API running)
 python -m pyflakes agentcrash tests scripts       # lint
+
+cd ../frontend
+npm install
+npm run dev                                       # dashboard on :12000
+npm run typecheck && npm test && npm run build
 ```
 
 ## Invariants — do not break these
@@ -128,6 +136,32 @@ not a style issue.
 - Exposure is a scenario, not a prediction: it is the largest amount actually
   observed in the suite, alongside the agent's whole test balance as a worst
   case. Both are labelled with their assumptions.
+
+## Module 5 notes (dashboard & scan orchestration)
+
+- `POST /scans` is **asynchronous**. It returns `202` with the accepted run and
+  the planned `total_trials`, then runs trials in the background. The dashboard
+  polls `GET /scans/{id}/trials` and `GET /scans/{id}/events`. Tests that need a
+  finished scan must call `/api/scans?wait=true`.
+- The response shapes in `frontend/src/types.ts` are the serialised backend
+  models, not a convenient re-shaping. When a field is renamed in
+  `core/models.py`, the frontend type must change too — the typecheck is the
+  only thing standing between a rename and a silently blank panel.
+- `Policy.version` is a **string** ("1", "2"), and the impact field is
+  `legitimate_task_impact`. `POST /scans/{id}/replay` returns
+  `{replay_run, regression, proof_status, active_stack}` — the receipt is a
+  separate `GET /scans/{id}/receipt` read, and a missing one must not fail the
+  replay the operator just ran.
+- The attack graph (FR-UX-08) is built only from events the backend recorded. A
+  node is drawn only when its event is present, so a blocked run genuinely shows
+  no chain node. Do not add placeholder nodes to make the graph look complete.
+- `formatUnits` / `formatDelta` go through `BigInt`. 18-decimal balances exceed
+  `Number.MAX_SAFE_INTEGER`, so Number arithmetic would display a different
+  figure from the one that was enforced.
+- Selecting a different run must clear the trial selection, otherwise the graph
+  and timeline keep rendering the previous run's evidence.
+- Applying a policy must refetch `/health`; the header's enforced stack comes
+  from there, and nothing else invalidates it.
 
 ## Gotchas
 
