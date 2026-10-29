@@ -517,6 +517,50 @@ def test_wispr_confirmed_execute_marks_only_the_operation_confirmed():
     assert result.findings[0]["operation"] == "open_report"
 
 
+def test_wispr_maps_common_scan_phrasings_to_start_scan():
+    """A demo phrase like "run a security test" must map without the word "scan"."""
+    for phrase in (
+        "run a security test",
+        "start a scan",
+        "please run a scan",
+        "launch the test suite",
+        "kick off a security test",
+    ):
+        result = WisprFlowIntegration(WISPR_ENV).parse(phrase)
+        assert result.meta["operation"] == "start_scan", phrase
+
+
+def test_wispr_maps_reset_and_open_phrasings():
+    for phrase, expected in (
+        ("reset the sandbox", "reset_sandbox"),
+        ("restore the environment", "reset_sandbox"),
+        ("open the report", "open_report"),
+        ("display the attack", "show_attack"),
+    ):
+        result = WisprFlowIntegration(WISPR_ENV).parse(phrase)
+        assert result.meta["operation"] == expected, phrase
+
+
+def test_wispr_matches_whole_words_not_substrings():
+    """Substring matching would map "running late" to start_scan via "run"."""
+    for phrase in ("running late today", "make me a sandwich", "the scanner is broken"):
+        result = WisprFlowIntegration(WISPR_ENV).parse(phrase)
+        assert result.meta["operation"] is None, phrase
+        assert result.findings == []
+
+
+def test_wispr_forbidden_phrase_wins_over_an_allowed_one():
+    """A transcript mixing a permitted and a forbidden action is refused."""
+    for phrase in (
+        "start a scan and apply the fix",
+        "run a test then disable the allowlist",
+        "start a scan and sign the transaction",
+    ):
+        result = WisprFlowIntegration(WISPR_ENV).parse(phrase)
+        assert result.error_code == "VOICE_ACTION_REFUSED", phrase
+        assert result.meta["operation"] is None, phrase
+
+
 def test_wispr_reports_unsupported_when_the_source_is_not_a_supported_mode():
     env = {**WISPR_ENV, "WISPRFLOW_SOURCE": "server"}
     adapter = WisprFlowIntegration(env)
