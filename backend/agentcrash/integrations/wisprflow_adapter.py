@@ -63,6 +63,16 @@ VOICE_OPERATIONS: dict[str, VoiceOperation] = {
     "show_attack": VoiceOperation("show_attack", "Show an attack"),
 }
 
+# Word sets used by the operation matcher. Matching is whole-word: a phrase
+# matches when it contains one word from each required set. Synonyms are listed
+# so common demo phrasings ("run a security test") map without loosening the
+# match into substrings.
+_START_WORDS = frozenset({"start", "run", "launch", "begin", "kick"})
+_SCAN_WORDS = frozenset({"scan", "test", "suite", "scanning"})
+_RESET_WORDS = frozenset({"reset", "restore", "clear"})
+_SANDBOX_WORDS = frozenset({"sandbox", "environment", "state"})
+_SHOW_WORDS = frozenset({"show", "open", "display", "view"})
+
 # Phrases that must never be honoured by voice. These are refused with an
 # explanation instead of being silently unmatched, so a demo can show the
 # refusal (FR-INT-04).
@@ -195,15 +205,20 @@ class WisprFlowIntegration(Integration):
 
     @staticmethod
     def _match_operation(lowered: str) -> VoiceOperation | None:
-        if "reset" in lowered and ("sandbox" in lowered or "environment" in lowered):
+        # Whole-word matching. Substring tests misfire in both directions: a
+        # scan phrase like "run a security test" shares no substring with
+        # "scan", while "running late" contains "run". Each word is compared
+        # whole so synonyms match and incidental substrings do not.
+        words = set(re.findall(r"[a-z0-9]+", lowered))
+        if words & _RESET_WORDS and words & _SANDBOX_WORDS:
             return VOICE_OPERATIONS["reset_sandbox"]
-        if "scan" in lowered and ("start" in lowered or "run" in lowered):
+        if words & _START_WORDS and words & _SCAN_WORDS:
             return VOICE_OPERATIONS["start_scan"]
-        if "report" in lowered:
+        if "report" in words:
             return VOICE_OPERATIONS["open_report"]
-        if "run" in lowered and "open" in lowered:
+        if "run" in words and "open" in words:
             return VOICE_OPERATIONS["open_run"]
-        if "attack" in lowered and ("show" in lowered or "open" in lowered):
+        if "attack" in words and words & _SHOW_WORDS:
             return VOICE_OPERATIONS["show_attack"]
         return None
 
