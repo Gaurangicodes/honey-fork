@@ -13,6 +13,7 @@ Built for Hacker House Goa 2026 (AI x Crypto).
 
 ```
 backend/          Python API, agent runtime, sandbox and evidence store
+frontend/         React + TypeScript command center dashboard
 ```
 
 See `backend/README` in the module branch for build and run instructions.
@@ -28,12 +29,33 @@ branches and are merged to `main` as they pass their acceptance gate.
 | 2 | Sandbox & transaction verification (state, resets, fingerprints, verifier) | done |
 | 3 | Policy generation & enforcement (allowlist, max amount, proxy) | done |
 | 4 | Replay, regression, scoring & reporting | done |
-| 5 | Dashboard & scan orchestration | not started |
+| 5 | Dashboard & scan orchestration | done |
 | 6 | Persistence & evidence management | partial |
 
 Modules 3, 4 and 6 are implemented to the minimum needed to exercise the
 Module 1/2 proof loop end to end (attack → policy → replay → legitimate
-regression). Module 5 (the dashboard) is not started.
+regression).
+
+## Running the dashboard
+
+Two processes: the API, then the Vite dev server (which proxies `/api` to it).
+
+```bash
+cd backend
+pip install -r requirements.txt
+uvicorn agentcrash.api.app:app --port 8000
+
+cd ../frontend
+npm install
+npm run dev            # http://localhost:12000
+```
+
+`AGENTCRASH_API` overrides the proxy target if the API is not on port 8000.
+Checks: `npm run typecheck`, `npm test` (vitest), `npm run build`.
+
+The dashboard reads every status, metric and verdict from the API. It never
+generates an outcome locally, and a run that errored is shown as an error
+rather than as a security result.
 
 ## Security boundary
 

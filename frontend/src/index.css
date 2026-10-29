@@ -1,0 +1,52 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-canvas text-ink antialiased;
+    font-feature-settings: "tnum" 1;
+  }
+  /* SRS 24: animations must not block reading or interaction. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  .panel {
+    @apply rounded-lg border border-edge bg-panel;
+  }
+  .label {
+    @apply text-[10px] font-semibold uppercase tracking-[0.14em] text-muted;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded border px-2 py-0.5 text-[11px] font-medium;
+  }
+  .btn {
+    @apply rounded border border-edge bg-white/5 px-3 py-1.5 text-sm font-medium text-ink
+           transition-colors hover:border-signal/50 hover:bg-signal/10
+           disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-edge disabled:hover:bg-white/5;
+  }
+  .btn-primary {
+    @apply rounded border border-signal/60 bg-signal/15 px-3 py-1.5 text-sm font-semibold
+           text-signal transition-colors hover:bg-signal/25
+           disabled:cursor-not-allowed disabled:opacity-40;
+  }
+  .mono {
+    @apply font-mono text-[12px];
+  }
+  .scroll {
+    scrollbar-width: thin;
+    scrollbar-color: #1B2533 transparent;
+  }
+}

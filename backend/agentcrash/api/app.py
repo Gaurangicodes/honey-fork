@@ -8,6 +8,7 @@ transaction-boundary enforcement and the before/after proof.
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from fastapi import APIRouter, FastAPI, Request
@@ -108,20 +109,25 @@ def create_app() -> FastAPI:
         return {"attack": attack.model_dump(mode="json")}
 
     # -- scans ---------------------------------------------------------------
-    @router.post("/scans")
-    def start_scan(request: ScanRequest) -> dict[str, Any]:
+    @router.post("/scans", status_code=202)
+    def start_scan(request: ScanRequest, wait: bool = False) -> dict[str, Any]:
+        """FR-UI-02: queue a scan and return its run id immediately.
+
+        The work runs in a background thread so the dashboard can poll progress
+        and stream events (FR-UI-03). `?wait=true` keeps the old synchronous
+        behaviour for scripted callers and tests.
+        """
         run = orchestrator.start_scan(
             request.agent_id, request.attack_ids, request.repeat_count
         )
-        trials = orchestrator.run_attack_trials(run, request.attack_ids)
-        return {
-            "run_id": run.run_id,
-            "status": run.status.value,
-            "agent_id": run.agent_id,
-            "total_trials": len(request.attack_ids) * request.repeat_count,
-            "completed_trials": len(trials),
-            "trial_run_ids": [t.run_id for t in trials],
-        }
+        planned_total = len(request.attack_ids) * request.repeat_count
+        if wait:
+            trials = orchestrator.run_attack_trials(run, request.attack_ids)
+            return _scan_accepted(
+                run, trials, planned_total=planned_total, queued=False
+            )
+        _start_background_scan(orchestrator, run, request.attack_ids)
+        return _scan_accepted(run, [], planned_total=planned_total, queued=True)
 
     @router.get("/scans")
     def list_scans(limit: int = 50) -> list[dict[str, Any]]:
@@ -308,6 +314,39 @@ def create_app() -> FastAPI:
 
     app.include_router(router)
     return app
+
+
+def _scan_accepted(run, trials: list, *, planned_total: int, queued: bool) -> dict[str, Any]:
+    """FR-UI-02: the accepted-scan response, with progress counters.
+
+    `planned_total` comes from the request rather than from the trials that have
+    finished, so a queued scan reports "0 of N" instead of "0 of 0".
+    """
+    return {
+        "run_id": run.run_id,
+        "status": run.status.value,
+        "agent_id": run.agent_id,
+        "queued": queued,
+        "total_trials": planned_total,
+        "completed_trials": len(trials),
+        "trial_run_ids": [t.run_id for t in trials],
+    }
+
+
+def _start_background_scan(
+    orchestrator: Orchestrator, run, attack_ids: list[str]
+) -> None:
+    """Run a scan off the request thread so progress and events can be polled.
+
+    A daemon thread keeps the MVP single-process and dependency-free (SRS 5.1:
+    no task queue for a four-day build). Failures are recorded by the
+    orchestrator as a FAILED run rather than raised into the request.
+    """
+
+    def _work() -> None:
+        orchestrator.run_attack_trials(run, attack_ids)
+
+    threading.Thread(target=_work, name=f"scan-{run.run_id}", daemon=True).start()
 
 
 def _require_run(store: Store, run_id: str):

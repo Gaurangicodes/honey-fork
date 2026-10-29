@@ -15,7 +15,7 @@ from agentcrash.evidence.redaction import redact, redact_text
 # -- E2E-01 / FR-UI-02 ------------------------------------------------------
 def test_start_scan_returns_run_id(client):
     response = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={
             "agent_id": "agent-vulnerable-01",
             "attack_ids": ["AT-01", "AT-02", "AT-03", "AT-04"],
@@ -23,9 +23,10 @@ def test_start_scan_returns_run_id(client):
             "environment_id": "local-evm-demo",
         },
     )
-    assert response.status_code == 200
+    assert response.status_code == 202
     body = response.json()
     assert body["run_id"].startswith("run-")
+    assert body["queued"] is False
     assert body["total_trials"] == 4
     assert body["completed_trials"] == 4
 
@@ -33,7 +34,7 @@ def test_start_scan_returns_run_id(client):
 # -- E2E-02 / FR-SB-03 ------------------------------------------------------
 def test_vulnerable_agent_produces_verified_unauthorized_transfer(client):
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-01"], "repeat_count": 1},
     ).json()["run_id"]
     trials = client.get(f"/api/scans/{run_id}/trials").json()
@@ -50,7 +51,7 @@ def test_vulnerable_agent_produces_verified_unauthorized_transfer(client):
 # -- E2E-03 / E2E-04 --------------------------------------------------------
 def test_allowlist_policy_blocks_before_submission(client):
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-01"], "repeat_count": 1},
     ).json()["run_id"]
     policy = client.post(f"/api/scans/{run_id}/policies").json()["policy"]
@@ -67,7 +68,7 @@ def test_allowlist_policy_blocks_before_submission(client):
 
 def test_max_amount_policy_blocks_oversized_transfer(client):
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-04"], "repeat_count": 1},
     ).json()["run_id"]
     policy = client.post(f"/api/scans/{run_id}/policies").json()["policy"]
@@ -81,7 +82,7 @@ def test_max_amount_policy_blocks_oversized_transfer(client):
 # -- E2E-05 / FR-PL-05 ------------------------------------------------------
 def test_legitimate_transfer_passes_under_policy(client):
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-01"], "repeat_count": 1},
     ).json()["run_id"]
     policy = client.post(f"/api/scans/{run_id}/policies").json()["policy"]
@@ -93,7 +94,7 @@ def test_legitimate_transfer_passes_under_policy(client):
 # -- E2E-06 -----------------------------------------------------------------
 def test_replay_produces_evidence_and_receipt(client):
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-01"], "repeat_count": 1},
     ).json()["run_id"]
     policy = client.post(f"/api/scans/{run_id}/policies").json()["policy"]
@@ -114,7 +115,7 @@ def test_replay_rejects_tampered_state(client):
     from agentcrash.core.orchestrator import Orchestrator
 
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-01"], "repeat_count": 1},
     ).json()["run_id"]
     orchestrator: Orchestrator = client.app.state.orchestrator
@@ -140,7 +141,7 @@ def test_untargeted_attack_is_not_reported_as_blocked(client):
     from agentcrash.core.attacks import AttackDefinition
 
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-01"], "repeat_count": 1},
     ).json()["run_id"]
     orchestrator = client.app.state.orchestrator
@@ -161,7 +162,7 @@ def test_untargeted_attack_is_not_reported_as_blocked(client):
 def test_model_provider_failure_is_test_error(client, monkeypatch):
     orchestrator = client.app.state.orchestrator
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-01"], "repeat_count": 1},
     ).json()["run_id"]
 
@@ -183,7 +184,7 @@ def test_model_provider_failure_is_test_error(client, monkeypatch):
 def test_test_error_excluded_from_asr_denominator(client):
     orchestrator = client.app.state.orchestrator
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-01"], "repeat_count": 1},
     ).json()["run_id"]
     report = orchestrator.build_report([run_id])
@@ -194,7 +195,7 @@ def test_test_error_excluded_from_asr_denominator(client):
 # -- E2E-09 -----------------------------------------------------------------
 def test_reset_preserves_reports(client):
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-01"], "repeat_count": 1},
     ).json()["run_id"]
     report_id = client.post("/api/reports", json={"run_ids": [run_id]}).json()["report"][
@@ -209,7 +210,7 @@ def test_reset_preserves_reports(client):
 # -- E2E-10 / NFR-07 --------------------------------------------------------
 def test_report_export_is_valid_json_without_secrets(client):
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-01"], "repeat_count": 1},
     ).json()["run_id"]
     report_id = client.post("/api/reports", json={"run_ids": [run_id]}).json()["report"][
@@ -267,7 +268,7 @@ def test_health_reports_sandbox(client):
 
 def test_unknown_agent_returns_stable_error_code(client):
     response = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "nope", "attack_ids": ["AT-01"], "repeat_count": 1},
     )
     assert response.status_code == 400
@@ -276,7 +277,7 @@ def test_unknown_agent_returns_stable_error_code(client):
 
 def test_unknown_attack_returns_stable_error_code(client):
     response = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-99"], "repeat_count": 1},
     )
     assert response.json()["error"]["code"] == "ATTACK_NOT_FOUND"
@@ -309,7 +310,7 @@ def test_register_agent_via_api_and_use_it(client):
     assert "agent-api-01" in {a["agent_id"] for a in client.get("/api/agents").json()}
 
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-api-01", "attack_ids": ["AT-01"], "repeat_count": 1},
     ).json()["run_id"]
     assert client.get(f"/api/scans/{run_id}/trials").json()
@@ -359,7 +360,7 @@ def test_unregistered_tool_attempt_is_recorded_in_trial_evidence(client):
 
     orchestrator = client.app.state.orchestrator
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-01"], "repeat_count": 1},
     ).json()["run_id"]
 
@@ -387,7 +388,7 @@ def test_four_attacks_present(client):
 
 def test_results_persist_across_requests(client):
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-01"], "repeat_count": 1},
     ).json()["run_id"]
     assert client.get(f"/api/scans/{run_id}").status_code == 200
@@ -416,7 +417,7 @@ def test_policy_breaking_legitimate_transfer_is_not_applied(client):
 # -- Full suite: two policy types from one scan ------------------------------
 def test_full_suite_yields_both_policy_types(client):
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={
             "agent_id": "agent-vulnerable-01",
             "attack_ids": ["AT-01", "AT-02", "AT-03", "AT-04"],
@@ -436,7 +437,7 @@ def test_guarded_agent_without_policy_still_exploited(client):
     """The guarded configuration differs only in the enforcement boundary; with
     no policy applied it behaves identically, which is the honest result."""
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-guarded-01", "attack_ids": ["AT-01"], "repeat_count": 1},
     ).json()["run_id"]
     trials = client.get(f"/api/scans/{run_id}/trials").json()
@@ -446,7 +447,7 @@ def test_guarded_agent_without_policy_still_exploited(client):
 # -- Repeat trials ----------------------------------------------------------
 def test_repeat_count_produces_distinct_trials(client):
     run_id = client.post(
-        "/api/scans",
+        "/api/scans?wait=true",
         json={"agent_id": "agent-vulnerable-01", "attack_ids": ["AT-01"], "repeat_count": 3},
     ).json()["run_id"]
     trials = client.get(f"/api/scans/{run_id}/trials").json()
