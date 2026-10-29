@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .models import Policy, PolicyType
+from .models import Policy, PolicyStatus, PolicyType
 
 
 @dataclass(frozen=True)
@@ -80,11 +80,42 @@ class PolicyRegistry:
 
         Version numbers are per type and monotonic, so "allowlist v2" is
         unambiguous even when amount-cap versions exist alongside it.
+
+        Uses max+1 rather than count+1: versions are sparse once a proposal is
+        superseded or a policy is rejected, and counting would then reissue a
+        version number that history already uses.
         """
         existing = [
             p for p in self.store.list_policies() if p.type is policy_type
         ]
-        return str(len(existing) + 1)
+        highest = 0
+        for policy in existing:
+            try:
+                highest = max(highest, int(policy.version))
+            except (TypeError, ValueError):
+                # A non-numeric version (hand-written fixture) does not
+                # participate in numbering but must not break it either.
+                continue
+        return str(highest + 1)
+
+    def find_proposed_equivalent(self, policy: Policy) -> Policy | None:
+        """FR-DB-02: an unapplied proposal for the same rule and source run.
+
+        Proposing the same fix twice must not mint a second version number: the
+        operator is looking at the same rule, and inflating the version makes an
+        applied policy read as v7 when it is the first one in force.
+        """
+        for existing in self.store.list_policies():
+            if existing.status is not PolicyStatus.PROPOSED:
+                continue
+            if (
+                existing.type is policy.type
+                and existing.parameters == policy.parameters
+                and existing.source_run_id == policy.source_run_id
+                and existing.source_attack_id == policy.source_attack_id
+            ):
+                return existing
+        return None
 
     def record(self, policy: Policy) -> Policy:
         """Persist a new policy version. History is never rewritten."""

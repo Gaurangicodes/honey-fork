@@ -8,10 +8,9 @@ real funds are involved (SR-01, SR-07).
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass, field
 
+from ..core.hashing import canonical_hash
 from ..core.models import BalanceDelta, EnvironmentSnapshot
 from .chain import SandboxChain, SimulatedChain
 
@@ -153,8 +152,12 @@ class SandboxManager:
 
 
 def _hash_config(config: dict) -> str:
-    canonical = json.dumps(config, sort_keys=True, separators=(",", ":"))
-    return "0x" + hashlib.sha256(canonical.encode()).hexdigest()
+    """Fingerprint the configuration (FR-SB-02).
+
+    Delegates to the shared canonical hash so a config fingerprint and an
+    evidence digest are produced by the same rules and cannot drift apart.
+    """
+    return canonical_hash(config)
 
 
 def default_demo_environment(

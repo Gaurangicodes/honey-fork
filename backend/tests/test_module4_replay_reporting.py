@@ -12,7 +12,10 @@ import json
 import pytest
 
 from agentcrash.core import reporting
+import hashlib
+
 from agentcrash.core.attacks import SAFE_TRANSFER_LIMIT
+from agentcrash.core.hashing import verify_integrity
 from agentcrash.core.models import (
     FixStatus,
     Policy,
@@ -370,25 +373,24 @@ def test_report_integrity_hash_detects_modification(orchestrator):
     It is an integrity check over the report body, not a signature: it detects
     later modification and proves nothing about whether the evidence is true.
     """
-    import hashlib
-
     run = orchestrator.start_scan("agent-vulnerable-01", ["AT-01"], 1)
     orchestrator.run_attack_trials(run, ["AT-01"])
     report = orchestrator.build_report([run.run_id])
 
-    def recompute(body):
-        canonical = json.loads(json.dumps(body))
-        canonical.pop("integrity_hash", None)
-        return "0x" + hashlib.sha256(
-            json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
+    assert verify_integrity(report)
+    assert report.integrity_hash.startswith("0x") and len(report.integrity_hash) == 66
 
+    # An independent recomputation over the canonical body must agree, so the
+    # check is not merely self-consistent with the helper that wrote the hash.
     body = report.model_dump(mode="json")
-    assert recompute(body) == report.integrity_hash
+    body.pop("integrity_hash")
+    expected = "0x" + hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert expected == report.integrity_hash
 
-    tampered = json.loads(json.dumps(body))
-    tampered["metrics"]["attack_success_rate"]["numerator"] = 0
-    assert recompute(tampered) != report.integrity_hash
+    report.metrics["attack_success_rate"]["numerator"] = 0
+    assert not verify_integrity(report)
 
 
 # -- API surface ----------------------------------------------------------

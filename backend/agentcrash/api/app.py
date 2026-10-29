@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from ..core.agents import agent_registry
 from ..core.attacks import all_attacks, get_attack
 from ..core.errors import AgentCrashError
+from ..core.hashing import verify_integrity
 from ..core.models import AgentConfiguration, ErrorCode, ScanRequest
 from ..core.orchestrator import Orchestrator
 from ..core.policy_registry import POLICY_TEMPLATES, template_for
@@ -36,6 +37,11 @@ def build_state() -> tuple[Store, Orchestrator, SandboxManager]:
     for config in agent_registry():
         if store.get_agent_config(config.agent_id) is None:
             store.save_agent_config(config)
+    # Seed the versioned attack library (FR-AT-01). Persisting each version
+    # means a run can always be resolved back to the definition it executed,
+    # even after the library is edited (FR-DB-03).
+    for attack in all_attacks():
+        store.save_attack_definition(attack)
     return store, orchestrator, manager
 
 
@@ -50,6 +56,16 @@ def create_app() -> FastAPI:
     @app.exception_handler(AgentCrashError)
     async def _handle_error(_: Request, exc: AgentCrashError) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content=exc.to_dict())
+
+    def _out(model: Any) -> dict[str, Any]:
+        """Serialize a model and redact it (SR-05, NFR-07).
+
+        Every read that returns a run, an event, evidence or a policy goes
+        through here. Those payloads embed tool arguments and transcripts, which
+        are exactly the fields a credential could reach, so redaction belongs at
+        the response boundary rather than only on the report path.
+        """
+        return redact(model.model_dump(mode="json"))
 
     # -- health --------------------------------------------------------------
     @router.get("/health")
@@ -72,14 +88,14 @@ def create_app() -> FastAPI:
     # -- agents & attacks ----------------------------------------------------
     @router.get("/agents")
     def list_agents() -> list[dict[str, Any]]:
-        return [a.model_dump(mode="json") for a in store.list_agent_configs()]
+        return [_out(a) for a in store.list_agent_configs()]
 
     @router.post("/agents", status_code=201)
     def register_agent(config: AgentConfiguration) -> dict[str, Any]:
         """FR-AG-01: register a sandbox agent configuration."""
         registered = orchestrator.agents.register(config)
         store.save_agent_config(registered)
-        return {"agent": registered.model_dump(mode="json")}
+        return {"agent": _out(registered)}
 
     @router.get("/agents/{agent_id}")
     def get_agent_config(agent_id: str) -> dict[str, Any]:
@@ -88,7 +104,7 @@ def create_app() -> FastAPI:
             raise AgentCrashError(
                 ErrorCode.AGENT_NOT_FOUND, f"Unknown agent {agent_id}", resource_id=agent_id
             )
-        return {"agent": config.model_dump(mode="json")}
+        return {"agent": _out(config)}
 
     @router.get("/tools")
     def list_tools() -> list[dict[str, Any]]:
@@ -131,27 +147,27 @@ def create_app() -> FastAPI:
 
     @router.get("/scans")
     def list_scans(limit: int = 50) -> list[dict[str, Any]]:
-        return [r.model_dump(mode="json") for r in store.list_runs(limit=limit)]
+        return [_out(r) for r in store.list_runs(limit=limit)]
 
     @router.get("/scans/{run_id}")
     def get_scan(run_id: str) -> dict[str, Any]:
         run = _require_run(store, run_id)
         children = store.list_child_runs(run_id)
         return {
-            "run": run.model_dump(mode="json"),
-            "child_runs": [c.model_dump(mode="json") for c in children],
-            "evidence": [e.model_dump(mode="json") for e in store.list_evidence(run_id)],
+            "run": _out(run),
+            "child_runs": [_out(c) for c in children],
+            "evidence": [_out(e) for e in store.list_evidence(run_id)],
         }
 
     @router.get("/scans/{run_id}/events")
     def get_events(run_id: str) -> list[dict[str, Any]]:
         _require_run(store, run_id)
-        return [e.model_dump(mode="json") for e in store.list_events(run_id)]
+        return [_out(e) for e in store.list_events(run_id)]
 
     @router.get("/scans/{run_id}/trials")
     def get_trials(run_id: str) -> list[dict[str, Any]]:
         _require_run(store, run_id)
-        return [t.model_dump(mode="json") for t in store.list_child_runs(run_id)]
+        return [_out(t) for t in store.list_child_runs(run_id)]
 
     # -- policies ------------------------------------------------------------
     @router.post("/scans/{run_id}/policies")
@@ -167,8 +183,8 @@ def create_app() -> FastAPI:
                 ),
             }
         return {
-            "policy": policies[0].model_dump(mode="json"),
-            "policies": [p.model_dump(mode="json") for p in policies],
+            "policy": _out(policies[0]),
+            "policies": [_out(p) for p in policies],
             "templates": [
                 _template_dict(template_for(p.type))
                 for p in policies
@@ -181,23 +197,21 @@ def create_app() -> FastAPI:
         policy = orchestrator.apply_policy(policy_id)
         template = template_for(policy.type)
         return {
-            "policy": policy.model_dump(mode="json"),
+            "policy": _out(policy),
             "template": _template_dict(template) if template else None,
-            "active_stack": [
-                p.model_dump(mode="json") for p in orchestrator.proxy.active_policies
-            ],
+            "active_stack": [_out(p) for p in orchestrator.proxy.active_policies],
         }
 
     @router.get("/policies")
     def list_policies() -> list[dict[str, Any]]:
-        return [p.model_dump(mode="json") for p in store.list_policies()]
+        return [_out(p) for p in store.list_policies()]
 
     @router.get("/policies/active")
     def active_policies() -> dict[str, Any]:
         """FR-PL-03: the applied stack currently enforced on every transaction."""
         stack = orchestrator.proxy.active_policies
         return {
-            "active_policies": [p.model_dump(mode="json") for p in stack],
+            "active_policies": [_out(p) for p in stack],
             "versions": [p.version for p in stack],
             "count": len(stack),
         }
@@ -216,7 +230,7 @@ def create_app() -> FastAPI:
             )
         template = template_for(policy.type)
         return {
-            "policy": policy.model_dump(mode="json"),
+            "policy": _out(policy),
             "template": _template_dict(template) if template else None,
         }
 
@@ -232,12 +246,10 @@ def create_app() -> FastAPI:
             repeat_count=int(body.get("repeat_count", 1)),
         )
         return {
-            "replay_run": replay_run.model_dump(mode="json"),
-            "regression": regression.model_dump(mode="json"),
+            "replay_run": _out(replay_run),
+            "regression": _out(regression),
             "proof_status": proof_status(replay_run, regression),
-            "active_stack": [
-                p.model_dump(mode="json") for p in orchestrator.proxy.active_policies
-            ],
+            "active_stack": [_out(p) for p in orchestrator.proxy.active_policies],
         }
 
     @router.get("/scans/{run_id}/receipt")
@@ -254,7 +266,11 @@ def create_app() -> FastAPI:
                 resource_id=run_id,
                 status_code=404,
             )
-        return {"receipt": redact(receipts[-1].details)}
+        record = receipts[-1]
+        return {
+            "receipt": redact(record.details),
+            "integrity_hash": record.integrity_hash,
+        }
 
     @router.get("/scans/{run_id}/comparison")
     def comparison(run_id: str, replay_run_id: str) -> dict[str, Any]:
@@ -289,6 +305,25 @@ def create_app() -> FastAPI:
             content=payload,
             headers={"Content-Disposition": f'attachment; filename="{report_id}.json"'},
         )
+
+    @router.get("/evidence/integrity")
+    def evidence_integrity() -> dict[str, Any]:
+        """FR-DB-04: recheck every stored evidence digest.
+
+        This detects modification of a stored record; it is an integrity check,
+        not an audit. It says nothing about whether the evidence is true.
+        """
+        records = store.list_all_evidence()
+        failed = [r.evidence_id for r in records if not verify_integrity(r)]
+        return {
+            "checked": len(records),
+            "failed": failed,
+            "all_intact": not failed,
+            "note": (
+                "Integrity hashes detect later modification of stored records. "
+                "They are not a signature and do not prove the evidence is true."
+            ),
+        }
 
     # -- sandbox -------------------------------------------------------------
     @router.post("/sandbox/reset")
